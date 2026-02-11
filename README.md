@@ -103,12 +103,8 @@ episodic_knowledge_mesh/
 │   │   ├── base.py                # Base provider classes
 │   │   ├── factory.py             # Provider factory
 │   │   ├── openai.py              # OpenAI provider
-│   │   ├── anthropic.py           # Anthropic provider
-│   │   ├── azure_openai.py        # Azure OpenAI provider
-│   │   ├── cohere.py              # Cohere provider
 │   │   ├── google_genai.py        # Google GenAI provider
-│   │   ├── groq.py                # Groq provider
-│   │   ├── ollama.py              # Ollama provider
+│   │   ├── deepseek.py            # Deepseek provider
 │   │   └── transformers.py        # Transformers provider
 │   └── storage/                   # Storage implementations
 │       ├── __init__.py
@@ -143,8 +139,6 @@ episodic_knowledge_mesh/
 │       └── frontend/              # Frontend implementation
 ├── migrations/                    # Database migrations
 │   └── __init__.py
-├── notebooks/                     # Jupyter notebooks
-│   └── exploration.ipynb          # Knowledge exploration notebook
 ├── results/                       # Output and results
 │   └── __init__.py
 ├── scripts/                       # Utility scripts
@@ -169,7 +163,6 @@ episodic_knowledge_mesh/
 │   └── performance.py             # Performance tests
 ├── .env.example                   # Environment variables template
 ├── .gitignore                     # Git ignore rules
-├── backend.spec                   # Backend specification
 ├── CONTRIBUTING.md                # Contribution guidelines
 ├── docker-compose.yml             # Docker configuration
 ├── ekm_cli.py                     # Command-line interface
@@ -179,7 +172,6 @@ episodic_knowledge_mesh/
 ├── pytest.ini                     # Pytest configuration
 ├── README.md                      # This file
 ├── requirements.txt               # Python dependencies
-└── test_persona_logic.py          # Persona logic tests
 ```
 
 ## Installation
@@ -192,8 +184,8 @@ episodic_knowledge_mesh/
 ### Quick Setup
 1. Clone the repository:
    ```bash
-   git clone https://github.com/your-repo/episodic-knowledge-mesh.git
-   cd episodic-knowledge-mesh
+   git clone https://github.com/kachrefv/ekm.git
+   cd ekm
    ```
 
 2. Create a virtual environment:
