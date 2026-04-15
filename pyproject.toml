@@ -21,38 +21,62 @@ classifiers = [
 ]
 requires-python = ">=3.11"
 dependencies = [
+    # Core dependencies
     "numpy>=1.21.0",
-    "scikit-learn>=1.0.0",
-    "torch>=1.10.0",
+    "typing-extensions",
+    
+    # Machine Learning
+    "scikit-learn>=1.3.0",
+    "torch>=2.0.0",
     "faiss-cpu>=1.7.0",
-    "sqlalchemy>=1.4.0",
-    "psycopg2-binary>=2.9.0",
-    "pgvector>=0.2.0",
-    "scipy>=1.7.0",
+    "scipy>=1.10.0",
+    
+    # Database & Storage (Async)
+    "sqlalchemy[asyncio]>=2.0.0",
+    "asyncpg>=0.27.0",      # Async PostgreSQL driver
+    "aiosqlite>=0.17.0",    # Async SQLite driver
+    "pgvector>=0.2.0",      # PostgreSQL vector extension
+    
+    # LLM Providers
+    "openai>=1.0.0",
+    "anthropic>=0.5.0",
+    "cohere>=4.0.0",
+    "google-generativeai>=0.3.0",
+    "groq>=0.3.0",
+    
+    # Embeddings and Vector Operations
+    "sentence-transformers>=2.6.0",
+    "transformers>=4.20.0",
+    
+    # Web Framework
+    "fastapi>=0.100.0",
+    "uvicorn>=0.20.0",
+    "pydantic>=2.0.0",
+    
+    # Utilities
+    "pyyaml>=6.0",
+    "tiktoken>=0.5.0",
+    "redis>=4.5.0",
     "pandas>=1.3.0",
     "requests>=2.25.0",
     "aiohttp>=3.8.0",
-    "openai>=1.0.0",
-    "google-genai>=0.2.0",
     "tenacity>=8.0.0",
     "python-dotenv>=0.19.0",
-    "sentence-transformers>=2.2.0",
-    "transformers>=4.20.0",
     "matplotlib>=3.5.0",
     "pypdf>=3.0.0",
     "httpx>=0.24.0",
-    "redis>=4.5.0",
     "python-multipart>=0.0.6",
-    "uvicorn>=0.20.0"
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=6.0",
-    "pytest-asyncio>=0.16.0",
-    "black>=22.0.0",
-    "flake8>=4.0.0",
-    "mypy>=0.950",
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.0.0",
+    "black>=23.0.0",
+    "flake8>=6.0.0",
+    "mypy>=1.0.0",
+    "isort>=5.0.0",
     "pre-commit>=2.17.0",
     "build",
     "wheel"
@@ -61,9 +85,9 @@ gpu = [
     "faiss-gpu>=1.7.0"
 ]
 test = [
-    "pytest>=6.0",
-    "pytest-asyncio>=0.16.0",
-    "pytest-cov>=3.0.0",
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.0.0",
     "psutil>=5.8.0"
 ]
 

@@ -1,46 +1,39 @@
 # Episodic Knowledge Mesh - Requirements
+# This file is kept for compatibility. Primary dependency management is via pyproject.toml
 
-# Core dependencies
-numpy>=1.21.0
-asyncio
-typing-extensions
+# Install the package with all dependencies
+-e .
 
-# LLM Providers
-openai>=1.0.0
-anthropic>=0.5.0
-cohere>=4.0.0
-google-generativeai>=0.3.0
-groq>=0.3.0
-
-# Embeddings and Vector Operations
-sentence-transformers>=2.6.0
-faiss-cpu>=1.7.0  # Use faiss-gpu for GPU support
-
-# Storage
-sqlalchemy>=2.0.0
-asyncpg>=0.27.0  # For PostgreSQL async support
-aiosqlite>=0.17.0  # For SQLite async support
-
-# Web Framework
-fastapi>=0.100.0
-uvicorn>=0.20.0
-pydantic>=2.0.0
-
-# Utilities
-pyyaml>=6.0
-tiktoken>=0.5.0
-redis>=4.5.0
-
-# Development and Testing
-pytest>=7.0.0
-pytest-asyncio>=0.21.0
-pytest-cov>=4.0.0
-black>=23.0.0
-flake8>=6.0.0
-mypy>=1.0.0
-isort>=5.0.0
-
-# Machine Learning
-torch>=2.0.0
-scikit-learn>=1.3.0
-scipy>=1.10.0
+# Or install dependencies directly (alternative):
+# numpy>=1.21.0
+# typing-extensions
+# scikit-learn>=1.3.0
+# torch>=2.0.0
+# faiss-cpu>=1.7.0
+# scipy>=1.10.0
+# sqlalchemy[asyncio]>=2.0.0
+# asyncpg>=0.27.0
+# aiosqlite>=0.17.0
+# pgvector>=0.2.0
+# openai>=1.0.0
+# anthropic>=0.5.0
+# cohere>=4.0.0
+# google-generativeai>=0.3.0
+# groq>=0.3.0
+# sentence-transformers>=2.6.0
+# transformers>=4.20.0
+# fastapi>=0.100.0
+# uvicorn>=0.20.0
+# pydantic>=2.0.0
+# pyyaml>=6.0
+# tiktoken>=0.5.0
+# redis>=4.5.0
+# pandas>=1.3.0
+# requests>=2.25.0
+# aiohttp>=3.8.0
+# tenacity>=8.0.0
+# python-dotenv>=0.19.0
+# matplotlib>=3.5.0
+# pypdf>=3.0.0
+# httpx>=0.24.0
+# python-multipart>=0.0.6

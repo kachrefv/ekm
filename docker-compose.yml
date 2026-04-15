@@ -7,8 +7,10 @@ services:
       - "8000:8000"
     environment:
       - DATABASE_URL=postgresql://ekm_user:ekm_password@db:5432/ekm_db
+      - EKM_DB_URL=postgresql://ekm_user:ekm_password@db:5432/ekm_db
       - REDIS_URL=redis://redis:6379
       - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
     depends_on:
       - db
       - redis

@@ -6,7 +6,7 @@ from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, UploadFile, File
 from fastapi.responses import StreamingResponse
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from ekm.core.models import Task, TaskStatus, Persona, ReflectiveConsciousness, AKU
 from ekm.core.agent import EKMAgent
@@ -25,13 +25,13 @@ router = APIRouter(tags=["Tasks"])
 
 # --- Background Task Helper ---
 async def run_training(workspace_id: str, contents: List[str]):
-    ekm = get_ekm_instance(workspace_id)
+    ekm = await get_ekm_instance(workspace_id)
     for content in contents:
         await ekm.train(workspace_id, content)
 
 @router.post("/train/{workspace_id}")
-async def train(workspace_id: str, background_tasks: BackgroundTasks, files: List[UploadFile] = File(...), db: Session = Depends(get_db)):
-    ekm = get_ekm_instance(workspace_id)
+async def train(workspace_id: str, background_tasks: BackgroundTasks, files: List[UploadFile] = File(...), db: AsyncSession = Depends(get_db)):
+    ekm = await get_ekm_instance(workspace_id)
     # Validate workspace existence indirectly or explicitly
     
     loader = DocumentLoader(llm_provider=ekm.llm)
@@ -53,8 +53,8 @@ async def train(workspace_id: str, background_tasks: BackgroundTasks, files: Lis
 
 
 @router.post("/sleep/{workspace_id}")
-async def sleep_cycle(workspace_id: str, db: Session = Depends(get_db)):
-    ekm = get_ekm_instance(workspace_id)
+async def sleep_cycle(workspace_id: str, db: AsyncSession = Depends(get_db)):
+    ekm = await get_ekm_instance(workspace_id)
     ws_uuid = uuid.UUID(workspace_id)
     
     # We might need a separate provider instance if we want specific config, 
@@ -102,9 +102,9 @@ async def sleep_cycle(workspace_id: str, db: Session = Depends(get_db)):
 
 
 @router.post("/deep_research/{workspace_id}")
-async def deep_research(request: DeepResearchRequest, db: Session = Depends(get_db)):
+async def deep_research(request: DeepResearchRequest, db: AsyncSession = Depends(get_db)):
     """Initiate a deep research task that generates a LaTeX PDF based on the query."""
-    ekm = get_ekm_instance(request.workspace_id)
+    ekm = await get_ekm_instance(request.workspace_id)
     try:
         agent = EKMAgent(ekm, request.workspace_id)
         
@@ -123,8 +123,8 @@ async def deep_research(request: DeepResearchRequest, db: Session = Depends(get_
     except Exception as e:
         import traceback
 # Helper function to format TaskResponse
-def get_task_response(tm: TaskManager, task_id: str) -> TaskResponse:
-    t = tm.get_task(task_id)
+async def get_task_response(tm: TaskManager, task_id: str) -> TaskResponse:
+    t = await tm.get_task(task_id)
     if not t:
         raise HTTPException(status_code=500, detail="Task creation failed or task not found")
     return TaskResponse(
@@ -140,31 +140,31 @@ def get_task_response(tm: TaskManager, task_id: str) -> TaskResponse:
 # --- Task Management Endpoints ---
 
 @router.post("/tasks", response_model=TaskResponse)
-async def create_task(request: TaskCreateRequest, db: Session = Depends(get_db)):
+async def create_task(request: TaskCreateRequest, db: AsyncSession = Depends(get_db)):
     """Create a new generic task."""
     tm = TaskManager(db_session=db, workspace_id=request.workspace_id)
-    task_id = tm.create_task(
+    task_id = await tm.create_task(
         name=request.name,
         description=request.description,
         task_metadata={"type": request.task_type}
     )
-    
+
     # Check if we need to start a known background job
     # For now, just generic task creation. Logic for running it specific to type
     # would go here or be triggered separately.
-    
-    return get_task_response(tm, str(task_id))
+
+    return await get_task_response(tm, str(task_id))
 
 @router.get("/tasks/{task_id}", response_model=TaskResponse)
-async def get_task(task_id: str, db: Session = Depends(get_db)):
+async def get_task(task_id: str, db: AsyncSession = Depends(get_db)):
     """Get the status of a specific task."""
-    # We don't know the workspace_id here easily without querying, 
+    # We don't know the workspace_id here easily without querying,
     # but TaskManager.get_task only needs DB.
     tm = TaskManager(db_session=db)
-    task = tm.get_task(task_id)
+    task = await tm.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-    
+
     return TaskResponse(
         id=str(task.id),
         name=task.name,
@@ -176,11 +176,11 @@ async def get_task(task_id: str, db: Session = Depends(get_db)):
     )
 
 @router.get("/workspaces/{workspace_id}/tasks", response_model=List[TaskResponse])
-async def list_tasks(workspace_id: str, db: Session = Depends(get_db)):
+async def list_tasks(workspace_id: str, db: AsyncSession = Depends(get_db)):
     """List all tasks for a workspace."""
     tm = TaskManager(db_session=db, workspace_id=workspace_id)
-    tasks = tm.get_all_tasks(limit=20)
-    
+    tasks = await tm.get_all_tasks(limit=20)
+
     response = []
     for task in tasks:
         response.append(TaskResponse(
@@ -206,7 +206,7 @@ async def tasks_events(workspace_id: str):
                 db = SessionLocal()
                 try:
                     tm = TaskManager(db_session=db, workspace_id=workspace_id)
-                    tasks = tm.get_all_tasks(limit=10)
+                    tasks = await tm.get_all_tasks(limit=10)
                     
                     # Serialize all fetched tasks (recent 10)
                     active_tasks = []
@@ -231,7 +231,7 @@ async def tasks_events(workspace_id: str):
                         yield ": keep-alive\n\n"
 
                 finally:
-                    db.close()
+                    await db.close()
                     
                 await asyncio.sleep(2) # Poll every 2 seconds
         except asyncio.CancelledError:
@@ -241,18 +241,18 @@ async def tasks_events(workspace_id: str):
 
 
 @router.post("/deep_research/{workspace_id}")
-async def deep_research(request: DeepResearchRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+async def deep_research(request: DeepResearchRequest, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):
     """Start a deep research task."""
     logger.info(f"Starting deep research for: {request.query}")
-    
-    ekm = get_ekm_instance(request.workspace_id)
+
+    ekm = await get_ekm_instance(request.workspace_id)
     agent = EKMAgent(ekm=ekm, workspace_id=request.workspace_id)
-    
+
     # Inject the current request session into the agent's task manager for this request scope:
-    agent.task_manager.db = db 
-    
+    agent.task_manager.db = db
+
     # Create the task entry
-    task_id = agent.task_manager.create_task(
+    task_id = await agent.task_manager.create_task(
         name=f"Deep Research: {request.query[:30]}...",
         description=f"Deep research on '{request.query}'",
         task_metadata={"type": "deep_research", "query": request.query}
@@ -262,13 +262,13 @@ async def deep_research(request: DeepResearchRequest, background_tasks: Backgrou
     async def run_research(tid: str, query: str, workspace_id: str, max_iterations: int):
         db_bg = SessionLocal()
         try:
-            ekm_bg = get_ekm_instance(workspace_id)
-            
+            ekm_bg = await get_ekm_instance(workspace_id)
+
             tm_bg = TaskManager(db_session=db_bg, workspace_id=workspace_id)
             
             # Update status to running
-            tm_bg.update_task_status(tid, TaskStatus.RUNNING)
-            tm_bg.update_task_progress(tid, 0.1)
+            await tm_bg.update_task_status(tid, TaskStatus.RUNNING)
+            await tm_bg.update_task_progress(tid, 0.1)
             
             # Fix: Temporarily patch the singleton's storage session for this background execution
             if hasattr(ekm_bg.storage, 'db'):
@@ -280,23 +280,23 @@ async def deep_research(request: DeepResearchRequest, background_tasks: Backgrou
             result = await agent_bg.generate_deep_research_pdf(query, max_iterations=max_iterations)
             
             if result.get("status") == "success":
-                tm_bg.set_task_result(tid, result.get("latex_content", ""))
-                tm_bg.update_task_status(tid, TaskStatus.COMPLETED)
-                tm_bg.update_task_progress(tid, 1.0)
+                await tm_bg.set_task_result(tid, result.get("latex_content", ""))
+                await tm_bg.update_task_status(tid, TaskStatus.COMPLETED)
+                await tm_bg.update_task_progress(tid, 1.0)
             else:
-                tm_bg.set_task_error(tid, result.get("latex_content", "Unknown error"))
-                tm_bg.update_task_status(tid, TaskStatus.FAILED)
+                await tm_bg.set_task_error(tid, result.get("latex_content", "Unknown error"))
+                await tm_bg.update_task_status(tid, TaskStatus.FAILED)
                 
         except Exception as e:
             logger.error(f"Background research failed for task {tid}: {e}", exc_info=True)
             try:
-                tm_bg.set_task_error(tid, str(e))
-                tm_bg.update_task_status(tid, TaskStatus.FAILED)
+                await tm_bg.set_task_error(tid, str(e))
+                await tm_bg.update_task_status(tid, TaskStatus.FAILED)
             except Exception as inner_e:
                 logger.error(f"Failed to update task {tid} with error: {inner_e}")
         finally:
-            db_bg.close()
+            await db_bg.close()
 
     background_tasks.add_task(run_research, str(task_id), request.query, request.workspace_id, request.max_iterations)
     
-    return get_task_response(agent.task_manager, str(task_id))
+    return await get_task_response(agent.task_manager, str(task_id))

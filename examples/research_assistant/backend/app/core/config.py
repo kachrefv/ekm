@@ -1,7 +1,7 @@
 import os
 
 class Settings:
-    DB_URL = os.environ.get("EKM_DB_URL", "sqlite:///ekm.db")
+    DB_URL = os.environ.get("EKM_DB_URL", "sqlite+aiosqlite:///ekm.db")
     # SECURITY NOTE: In production, this must be set via environment variable. 
     # Fallback is only for local dev convenience if user hasn't set it yet.
     GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") 

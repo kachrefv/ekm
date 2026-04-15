@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(C:\\Users\\kachref\\Documents\\GitHub\\ekm/**)",
+      "Read(C:\\Users\\kachref\\Documents\\GitHub\\ekm\\tests/**)"
+    ]
+  },
+  "$version": 3
+}

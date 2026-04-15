@@ -10,8 +10,7 @@ logger = logging.getLogger(__name__)
 from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 
 # Custom JSON encoder to handle numpy types
 import fastapi.encoders as encoders
@@ -63,12 +62,24 @@ app.add_middleware(
 DB_URL = os.environ.get("EKM_DB_URL", "sqlite:///ekm.db")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-# Initialize EKM Components
-engine = create_engine(DB_URL)
-Base.metadata.create_all(engine)
-SessionLocal = sessionmaker(bind=engine)
+# Convert DB_URL to async dialect if needed
+if DB_URL.startswith("sqlite://"):
+    DB_URL = DB_URL.replace("sqlite://", "sqlite+aiosqlite://", 1)
+elif DB_URL.startswith("postgresql://"):
+    DB_URL = DB_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
 
-def get_ekm_instance(workspace_id: Optional[str] = None):
+# Initialize EKM Components with async engine
+engine = create_async_engine(DB_URL)
+
+# Create tables (run synchronously on async engine)
+@app.on_event("startup")
+async def create_tables():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+SessionLocal = async_sessionmaker(bind=engine, class_=AsyncSession)
+
+async def get_ekm_instance(workspace_id: Optional[str] = None):
     db_session = SessionLocal()
     storage = SQLStorage(db=db_session)
     api_key = GEMINI_API_KEY
@@ -86,8 +97,12 @@ def get_ekm_instance(workspace_id: Optional[str] = None):
     # Override with database settings if workspace exists
     if workspace_id:
         try:
+            from sqlalchemy import select
             ws_uuid = uuid.UUID(workspace_id) if isinstance(workspace_id, str) else workspace_id
-            settings = db_session.query(Setting).filter(Setting.workspace_id == ws_uuid).all()
+            result = await db_session.execute(
+                select(Setting).where(Setting.workspace_id == ws_uuid)
+            )
+            settings = result.scalars().all()
             for s in settings:
                 config[s.key] = s.value
         except Exception as e:
@@ -156,68 +171,86 @@ class TaskResponse(BaseModel):
 
 @app.get("/workspaces", response_model=List[WorkspaceInfo])
 async def list_workspaces():
-    _, db = get_ekm_instance()
+    _, db = await get_ekm_instance()
     try:
-        workspaces = db.query(Workspace).all()
+        from sqlalchemy import select
+        result = await db.execute(select(Workspace))
+        workspaces = result.scalars().all()
         return [{"id": str(w.id), "name": w.name} for w in workspaces]
     finally:
-        db.close()
+        await db.close()
 
 @app.post("/workspaces", response_model=WorkspaceInfo)
 async def create_workspace(name: str):
-    _, db = get_ekm_instance()
+    _, db = await get_ekm_instance()
     try:
         new_id = uuid.uuid4()
         workspace = Workspace(id=new_id, name=name, user_id="gui_user")
         db.add(workspace)
-        db.commit()
+        await db.commit()
         return {"id": str(new_id), "name": name}
     finally:
-        db.close()
+        await db.close()
 
 @app.get("/workspaces/{workspace_id}/sessions")
 async def get_sessions(workspace_id: str):
-    _, db = get_ekm_instance(workspace_id)
+    _, db = await get_ekm_instance(workspace_id)
     try:
+        from sqlalchemy import select
         ws_uuid = uuid.UUID(workspace_id)
-        sessions = db.query(ChatSession).filter(ChatSession.workspace_id == ws_uuid).order_by(ChatSession.created_at.desc()).all()
+        result = await db.execute(
+            select(ChatSession)
+            .where(ChatSession.workspace_id == ws_uuid)
+            .order_by(ChatSession.created_at.desc())
+        )
+        sessions = result.scalars().all()
         return [{"id": str(s.id), "name": s.name, "created_at": s.created_at} for s in sessions]
     finally:
-        db.close()
+        await db.close()
 
 @app.post("/sessions")
 async def create_session(request: SessionCreate):
-    _, db = get_ekm_instance(request.workspace_id)
+    _, db = await get_ekm_instance(request.workspace_id)
     try:
         ws_uuid = uuid.UUID(request.workspace_id)
         new_id = uuid.uuid4()
         session = ChatSession(id=new_id, workspace_id=ws_uuid, name=request.name)
         db.add(session)
-        db.commit()
+        await db.commit()
         return {"id": str(new_id), "name": request.name}
     finally:
-        db.close()
+        await db.close()
 
 @app.delete("/sessions/{session_id}")
 async def delete_session(session_id: str):
-    _, db = get_ekm_instance()
+    _, db = await get_ekm_instance()
     try:
+        from sqlalchemy import select
         sid = uuid.UUID(session_id)
-        session = db.query(ChatSession).filter(ChatSession.id == sid).first()
+        result = await db.execute(
+            select(ChatSession).where(ChatSession.id == sid)
+        )
+        session = result.scalar_one_or_none()
         if session:
             db.delete(session)
-            db.commit()
+            await db.commit()
             return {"status": "deleted"}
         raise HTTPException(status_code=404, detail="Session not found")
     finally:
-        db.close()
+        await db.close()
 
 @app.get("/sessions/{session_id}/messages")
 async def get_messages(session_id: str):
-    _, db = get_ekm_instance()
+    _, db = await get_ekm_instance()
     try:
+        from sqlalchemy import select
         sid = uuid.UUID(session_id)
-        messages = db.query(ChatMessage).filter(ChatMessage.session_id == sid).order_by(ChatMessage.created_at.asc()).all()
+        result = await db.execute(
+            select(ChatMessage)
+            .where(ChatMessage.session_id == sid)
+            .order_by(ChatMessage.created_at.asc())
+        )
+        messages = result.scalars().all()
         return [
             {
                 "role": m.role,
@@ -228,17 +261,21 @@ async def get_messages(session_id: str):
             } for m in messages
         ]
     finally:
-        db.close()
+        await db.close()
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
-    ekm, db = get_ekm_instance(request.workspace_id)
+    from sqlalchemy import select
+    ekm, db = await get_ekm_instance(request.workspace_id)
     try:
         session_id = request.session_id
         session = None
         if session_id:
             sid = uuid.UUID(session_id)
-            session = db.query(ChatSession).filter(ChatSession.id == sid).first()
+            result = await db.execute(
+                select(ChatSession).where(ChatSession.id == sid)
+            )
+            session = result.scalar_one_or_none()
 
         # If no session provided or not found, create one (fallback)
         if not session:
@@ -246,7 +283,7 @@ async def chat(request: ChatRequest):
             new_id = uuid.uuid4()
             session = ChatSession(id=new_id, workspace_id=ws_uuid, name=request.message[:30] + "...")
             db.add(session)
-            db.flush()
+            await db.flush()
             session_id = str(new_id)
 
         # Initialize Agent with focus buffer from session
@@ -277,12 +314,27 @@ async def chat(request: ChatRequest):
                     logger.error(f"Focus buffer fallback also failed: {fallback_error}")
 
         # Fetch recent history for context
-        history_msgs = db.query(ChatMessage).filter(ChatMessage.session_id == session.id).order_by(ChatMessage.created_at.desc()).limit(10).all()
+        result = await db.execute(
+            select(ChatMessage)
+            .where(ChatMessage.session_id == session.id)
+            .order_by(ChatMessage.created_at.desc())
+            .limit(10)
+        )
+        history_msgs = result.scalars().all()
         agent.history = [{"role": m.role, "content": m.content} for m in reversed(history_msgs)]
 
         # Load persona and reflection if available
-        persona_data = db.query(Persona).filter(Persona.workspace_id == uuid.UUID(request.workspace_id)).first()
-        consciousness_data = db.query(ReflectiveConsciousness).filter(ReflectiveConsciousness.workspace_id == uuid.UUID(request.workspace_id)).order_by(ReflectiveConsciousness.created_at.desc()).first()
+        ws_uuid = uuid.UUID(request.workspace_id)
+        result = await db.execute(
+            select(Persona).where(Persona.workspace_id == ws_uuid)
+        )
+        persona_data = result.scalar_one_or_none()
+        result2 = await db.execute(
+            select(ReflectiveConsciousness)
+            .where(ReflectiveConsciousness.workspace_id == ws_uuid)
+            .order_by(ReflectiveConsciousness.created_at.desc())
+        )
+        consciousness_data = result2.scalar_one_or_none()
 
         # Pass to agent (we'll need to update EKMAgent.chat to accept these or set them)
         agent.persona = {
@@ -293,7 +345,7 @@ async def chat(request: ChatRequest):
         agent.current_consciousness = consciousness_data
 
         result = await agent.chat(
-            request.message, 
+            request.message,
             include_chain_of_thoughts=request.include_chain_of_thoughts,
             use_agentic_system=request.use_agentic_system
         )
@@ -320,7 +372,7 @@ async def chat(request: ChatRequest):
         # Persist FocusBuffer state
         session.focus_buffer_state = {k: v.model_dump() for k, v in agent.focus_buffer.items.items()}
 
-        db.commit()
+        await db.commit()
 
         return {
             "response": result["response"],
@@ -330,19 +382,23 @@ async def chat(request: ChatRequest):
             "chain_of_thoughts": result.get("chain_of_thoughts")
         }
     except Exception as e:
-        db.rollback()
+        await db.rollback()
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        db.close()
+        await db.close()
 
 @app.get("/workspaces/{workspace_id}/persona", response_model=PersonaInfo)
 async def get_persona(workspace_id: str):
-    _, db = get_ekm_instance(workspace_id)
+    _, db = await get_ekm_instance(workspace_id)
     try:
+        from sqlalchemy import select
         ws_uuid = uuid.UUID(workspace_id)
-        persona = db.query(Persona).filter(Persona.workspace_id == ws_uuid).first()
+        result = await db.execute(
+            select(Persona).where(Persona.workspace_id == ws_uuid)
+        )
+        persona = result.scalar_one_or_none()
         if not persona:
             # Return a default persona
             return {"name": "EKM Assistant", "personality": "helpful, curious", "voice_style": "professional"}
@@ -352,14 +408,18 @@ async def get_persona(workspace_id: str):
             "voice_style": persona.voice_style
         }
     finally:
-        db.close()
+        await db.close()
 
 @app.put("/workspaces/{workspace_id}/persona", response_model=PersonaInfo)
 async def update_persona(workspace_id: str, request: PersonaUpdate):
-    _, db = get_ekm_instance(workspace_id)
+    from sqlalchemy import select
+    _, db = await get_ekm_instance(workspace_id)
     try:
         ws_uuid = uuid.UUID(workspace_id)
-        persona = db.query(Persona).filter(Persona.workspace_id == ws_uuid).first()
+        result = await db.execute(
+            select(Persona).where(Persona.workspace_id == ws_uuid)
+        )
+        persona = result.scalar_one_or_none()
         if not persona:
             persona = Persona(workspace_id=ws_uuid, name=request.name)
             db.add(persona)
@@ -367,21 +427,27 @@ async def update_persona(workspace_id: str, request: PersonaUpdate):
         persona.name = request.name
         persona.personality = request.personality
         persona.voice_style = request.voice_style
-        db.commit()
+        await db.commit()
         return {
             "name": persona.name,
             "personality": persona.personality,
             "voice_style": persona.voice_style
         }
     finally:
-        db.close()
+        await db.close()
 
 @app.get("/workspaces/{workspace_id}/consciousness")
 async def get_consciousness(workspace_id: str):
-    _, db = get_ekm_instance(workspace_id)
+    from sqlalchemy import select
+    _, db = await get_ekm_instance(workspace_id)
     try:
         ws_uuid = uuid.UUID(workspace_id)
-        consciousness = db.query(ReflectiveConsciousness).filter(ReflectiveConsciousness.workspace_id == ws_uuid).order_by(ReflectiveConsciousness.created_at.desc()).first()
+        result = await db.execute(
+            select(ReflectiveConsciousness)
+            .where(ReflectiveConsciousness.workspace_id == ws_uuid)
+            .order_by(ReflectiveConsciousness.created_at.desc())
+        )
+        consciousness = result.scalar_one_or_none()
         if not consciousness:
             return {"mood": "Stable", "thought_summary": "I am ready to help."}
         return {
@@ -391,37 +457,44 @@ async def get_consciousness(workspace_id: str):
             "created_at": consciousness.created_at
         }
     finally:
-        db.close()
+        await db.close()
 
 @app.get("/workspaces/{workspace_id}/settings")
 async def get_settings(workspace_id: str):
-    ekm, db = get_ekm_instance(workspace_id)
+    ekm, db = await get_ekm_instance(workspace_id)
     try:
         # get_ekm_instance already merges DB settings into the default config
         return {"settings": ekm.config}
     finally:
-        db.close()
+        await db.close()
 
 @app.put("/workspaces/{workspace_id}/settings")
 async def update_settings(workspace_id: str, settings: Dict[str, Any]):
-    _, db = get_ekm_instance(workspace_id)
+    from sqlalchemy import select
+    _, db = await get_ekm_instance(workspace_id)
     try:
         ws_uuid = uuid.UUID(workspace_id)
         for key, value in settings.items():
-            setting = db.query(Setting).filter(Setting.workspace_id == ws_uuid, Setting.key == key).first()
+            result = await db.execute(
+                select(Setting).where(
+                    Setting.workspace_id == ws_uuid,
+                    Setting.key == key
+                )
+            )
+            setting = result.scalar_one_or_none()
             if not setting:
                 setting = Setting(workspace_id=ws_uuid, key=key, value=value)
                 db.add(setting)
             else:
                 setting.value = value
-        db.commit()
+        await db.commit()
         return {"status": "updated"}
     finally:
-        db.close()
+        await db.close()
 
 @app.post("/train/{workspace_id}")
 async def train(workspace_id: str, background_tasks: BackgroundTasks, files: List[UploadFile] = File(...)):
-    ekm, db = get_ekm_instance(workspace_id)
+    ekm, db = await get_ekm_instance(workspace_id)
     try:
         loader = DocumentLoader(llm_provider=ekm.llm)
         contents_to_train = []
@@ -442,11 +515,12 @@ async def train(workspace_id: str, background_tasks: BackgroundTasks, files: Lis
         background_tasks.add_task(run_training)
         return {"status": "Processing", "file_count": len(contents_to_train)}
     finally:
-        db.close()
+        await db.close()
 
 @app.post("/sleep/{workspace_id}")
 async def sleep_cycle(workspace_id: str):
-    ekm, db = get_ekm_instance(workspace_id)
+    from sqlalchemy import select
+    ekm, db = await get_ekm_instance(workspace_id)
     try:
         ws_uuid = uuid.UUID(workspace_id)
         api_key = GEMINI_API_KEY
@@ -456,12 +530,21 @@ async def sleep_cycle(workspace_id: str):
 
         # --- SELF-REFLECTION ADDITION ---
         # Fetch some recent AKUs for context
-        akus = db.query(AKU).filter(AKU.workspace_id == ws_uuid).order_by(AKU.created_at.desc()).limit(20).all()
+        result = await db.execute(
+            select(AKU)
+            .where(AKU.workspace_id == ws_uuid)
+            .order_by(AKU.created_at.desc())
+            .limit(20)
+        )
+        akus = result.scalars().all()
         recent_context = "\n".join([a.content for a in akus])
 
         agent = EKMAgent(ekm, workspace_id)
         # Load persona
-        persona_data = db.query(Persona).filter(Persona.workspace_id == ws_uuid).first()
+        result2 = await db.execute(
+            select(Persona).where(Persona.workspace_id == ws_uuid)
+        )
+        persona_data = result2.scalar_one_or_none()
         if persona_data:
             agent.persona = {
                 "name": persona_data.name,
@@ -479,7 +562,7 @@ async def sleep_cycle(workspace_id: str):
             focus_topics=reflection.get("focus_topics", [])
         )
         db.add(consciousness)
-        db.commit()
+        await db.commit()
 
         return {
             "status": "Complete",
@@ -487,7 +570,7 @@ async def sleep_cycle(workspace_id: str):
             "reflection": reflection
         }
     finally:
-        db.close()
+        await db.close()
 
 
 # ────────────────────────────────────────────────────────────
@@ -497,13 +580,17 @@ async def sleep_cycle(workspace_id: str):
 @app.post("/deep_research/{workspace_id}")
 async def deep_research(request: DeepResearchRequest):
     """Initiate a deep research task that generates a LaTeX PDF based on the query."""
-    ekm, db = get_ekm_instance(request.workspace_id)
+    from sqlalchemy import select
+    ekm, db = await get_ekm_instance(request.workspace_id)
     try:
         agent = EKMAgent(ekm, request.workspace_id)
-        
+
         # Load persona
         ws_uuid = uuid.UUID(request.workspace_id)
-        persona_data = db.query(Persona).filter(Persona.workspace_id == ws_uuid).first()
+        result = await db.execute(
+            select(Persona).where(Persona.workspace_id == ws_uuid)
+        )
+        persona_data = result.scalar_one_or_none()
         if persona_data:
             agent.persona = {
                 "name": persona_data.name,
@@ -513,37 +600,37 @@ async def deep_research(request: DeepResearchRequest):
 
         # Perform deep research
         result = await agent.generate_deep_research_pdf(request.query, max_iterations=request.max_iterations)
-        
+
         return result
     except Exception as e:
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        db.close()
+        await db.close()
 
 @app.post("/tasks")
 async def create_task(request: TaskCreateRequest):
     """Create a new task in the task manager."""
-    ekm, db = get_ekm_instance(request.workspace_id)
+    ekm, db = await get_ekm_instance(request.workspace_id)
     try:
         agent = EKMAgent(ekm, request.workspace_id)
-        
+
         # Create task in the task manager
         task_id = agent.task_manager.create_task(
             name=request.name,
             description=request.description,
             task_metadata={"task_type": request.task_type, "workspace_id": request.workspace_id}
         )
-        
+
         # For certain task types, we can start them immediately
         if request.task_type == "deep_research":
             # In a real implementation, we would queue this task
             # For now, we'll just return the task info
             pass
-        
+
         task = agent.task_manager.get_task(task_id)
-        
+
         return TaskResponse(
             id=task.id,
             name=task.name,
@@ -556,7 +643,7 @@ async def create_task(request: TaskCreateRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        db.close()
+        await db.close()
 
 @app.get("/tasks/{task_id}")
 async def get_task(task_id: str):
@@ -575,11 +662,17 @@ async def get_task(task_id: str):
 @app.get("/tasks/workspace/{workspace_id}")
 async def get_workspace_tasks(workspace_id: str):
     """Get all tasks for a specific workspace."""
-    _, db = get_ekm_instance(workspace_id)
+    from sqlalchemy import select
+    _, db = await get_ekm_instance(workspace_id)
     try:
         ws_uuid = uuid.UUID(workspace_id)
-        tasks = db.query(Task).filter(Task.workspace_id == ws_uuid).order_by(Task.created_at.desc()).all()
-        
+        result = await db.execute(
+            select(Task)
+            .where(Task.workspace_id == ws_uuid)
+            .order_by(Task.created_at.desc())
+        )
+        tasks = result.scalars().all()
+
         return [{
             "id": str(task.id),
             "name": task.name,
@@ -592,13 +685,13 @@ async def get_workspace_tasks(workspace_id: str):
             "updated_at": task.updated_at
         } for task in tasks]
     finally:
-        db.close()
+        await db.close()
 
 
 @app.post("/tasks/deep_research")
 async def create_deep_research_task(request: TaskCreateRequest):
     """Create a deep research task."""
-    ekm, db = get_ekm_instance(request.workspace_id)
+    ekm, db = await get_ekm_instance(request.workspace_id)
     try:
         # Create the task record in the database
         task_db = Task(
@@ -610,9 +703,9 @@ async def create_deep_research_task(request: TaskCreateRequest):
             task_metadata={"task_type": request.task_type}
         )
         db.add(task_db)
-        db.commit()
-        db.refresh(task_db)
-        
+        await db.commit()
+        await db.refresh(task_db)
+
         # In a real implementation, we would queue this task for background processing
         # For now, we'll return the task info
         return TaskResponse(
@@ -625,10 +718,10 @@ async def create_deep_research_task(request: TaskCreateRequest):
             error=task_db.error
         )
     except Exception as e:
-        db.rollback()
+        await db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        db.close()
+        await db.close()
 
 
 # ────────────────────────────────────────────────────────────
@@ -696,12 +789,14 @@ def _project_to_3d(embeddings: List[List[float]], scale: float = 8.0) -> List[Li
 @app.get("/graph/{workspace_id}")
 async def get_graph(workspace_id: str):
     """Return the full knowledge graph for 3D visualization."""
-    _, db = get_ekm_instance(workspace_id)
+    from sqlalchemy import select
+    _, db = await get_ekm_instance(workspace_id)
     try:
         ws_uuid = uuid.UUID(workspace_id)
 
         # --- Fetch AKUs ---
-        akus = db.query(AKU).filter(AKU.workspace_id == ws_uuid).all()
+        result = await db.execute(select(AKU).where(AKU.workspace_id == ws_uuid))
+        akus = result.scalars().all()
         aku_embeddings = []
         aku_ids = []
         aku_has_embedding = {}
@@ -713,7 +808,8 @@ async def get_graph(workspace_id: str):
             aku_ids.append(str(a.id))
 
         # --- Fetch GKUs ---
-        gkus = db.query(GKU).filter(GKU.workspace_id == ws_uuid).all()
+        result = await db.execute(select(GKU).where(GKU.workspace_id == ws_uuid))
+        gkus = result.scalars().all()
         gku_embeddings = []
         gku_has_embedding = {}
         for g in gkus:
@@ -768,7 +864,10 @@ async def get_graph(workspace_id: str):
             })
 
         # --- Fetch edges (AKU relationships) ---
-        rels = db.query(AKURelationship).filter(AKURelationship.workspace_id == ws_uuid).all()
+        result = await db.execute(
+            select(AKURelationship).where(AKURelationship.workspace_id == ws_uuid)
+        )
+        rels = result.scalars().all()
         edges = []
         for r in rels:
             edge_type = "semantic"
@@ -790,7 +889,8 @@ async def get_graph(workspace_id: str):
             })
 
         # --- GKU → AKU membership edges ---
-        assoc_rows = db.query(gku_aku_association).all()
+        result = await db.execute(select(gku_aku_association))
+        assoc_rows = result.all()
         for row in assoc_rows:
             edges.append({
                 "source": str(row.gku_id),
@@ -811,7 +911,7 @@ async def get_graph(workspace_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        db.close()
+        await db.close()
 
 
 if __name__ == "__main__":

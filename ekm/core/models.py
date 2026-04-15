@@ -214,13 +214,73 @@ class Task(Base):
     description = Column(Text)
     status = Column(String, default=TaskStatus.PENDING.value)  # Store as string
     progress = Column(Float, default=0.0)  # 0.0 to 1.0
-    result = Column(Text)  # Store result as text/JSON
+    result = Column(JSON)  # Store result as JSON
     error = Column(Text)   # Store error message if any
     task_metadata = Column(JSON)  # Additional metadata as JSON (renamed from 'metadata')
+    version = Column(Integer, default=0, nullable=False)  # For optimistic locking
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     workspace = relationship("Workspace", back_populates="tasks")
+
+
+class JobStatus(Enum):
+    """Status of a job in the queue."""
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    RETRYING = "retrying"
+    DEAD_LETTER = "dead_letter"
+    CANCELLED = "cancelled"
+
+
+class Job(Base):
+    """Represents a job in the queue for task execution."""
+    __tablename__ = 'ekm_jobs'
+    __table_args__ = {'extend_existing': True}
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    task_id = Column(UUID(as_uuid=True), ForeignKey('ekm_tasks.id'), nullable=False, unique=True)
+    status = Column(String, default=JobStatus.PENDING.value)
+    queue_name = Column(String, default='default', nullable=False)
+    priority = Column(Integer, default=0, nullable=False)  # Lower number = higher priority
+    attempts = Column(Integer, default=0, nullable=False)
+    max_attempts = Column(Integer, default=3, nullable=False)
+    last_attempt_at = Column(DateTime(timezone=True))
+    next_attempt_at = Column(DateTime(timezone=True))
+    locked_at = Column(DateTime(timezone=True))
+    locked_by = Column(String)  # Worker identifier
+    scheduled_at = Column(DateTime(timezone=True), server_default=func.now())
+    error_message = Column(Text)
+    error_details = Column(JSON)  # Detailed error information
+    execution_log = Column(JSON, default=list)  # Array of log entries
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    
+    task = relationship("Task", back_populates="job", uselist=False)
+
+
+class TaskEvent(Base):
+    __tablename__ = 'ekm_task_events'
+    __table_args__ = {'extend_existing': True}
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    task_id = Column(UUID(as_uuid=True), ForeignKey('ekm_tasks.id'), nullable=False)
+    job_id = Column(UUID(as_uuid=True), ForeignKey('ekm_jobs.id'), nullable=True)
+    event_type = Column(String, nullable=False)  # e.g., 'created', 'started', 'completed', 'failed', 'retry'
+    event_data = Column(JSON)  # Additional event data
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    task = relationship("Task", back_populates="events")
+    job = relationship("Job")
+
+
+# Add relationship from Task to Job
+Task.job = relationship("Job", back_populates="task", cascade="all, delete-orphan", uselist=False)
+
+# Add relationship from Task to events
+Task.events = relationship("TaskEvent", back_populates="task", cascade="all, delete-orphan")
 
 
 # Add relationship to Workspace

@@ -15,7 +15,7 @@ from ekm.providers.base import BaseLLM, BaseEmbeddings
 from ekm.utils.document_loader import DocumentLoader
 
 # Configuration (In a real app, these would come from env vars or config file)
-os.environ.setdefault("GEMINI_API_KEY", "")
+os.environ.setdefault("GEMINI_API_KEY", "AIzaSyAMyVC0P6mLcZZ4aQ8KyA4ByAXVxPDuQ5E")
 
 async def get_or_create_workspace(storage: SQLStorage, name: str) -> str:
     """Resolve a human-readable name to a UUID string."""
@@ -26,13 +26,18 @@ async def get_or_create_workspace(storage: SQLStorage, name: str) -> str:
         return name
     except ValueError:
         # Look up by name or create
+        from sqlalchemy import select
         from ekm.core.models import Workspace
-        workspace = storage.db.query(Workspace).filter(Workspace.name == name).first()
+        result = await storage.db.execute(
+            select(Workspace).where(Workspace.name == name)
+        )
+        workspace = result.scalar_one_or_none()
         if not workspace:
             print(f" [+] Creating new workspace: {name}")
             workspace = Workspace(id=uuid.uuid4(), name=name, user_id="cli_user")
             storage.db.add(workspace)
-            storage.db.commit()
+            await storage.db.commit()
+            await storage.db.refresh(workspace)
         return str(workspace.id)
 
 async def train_files(ekm: EKM, workspace_id: str, file_paths: List[str]):
@@ -61,8 +66,12 @@ async def chat_loop(ekm: EKM, workspace_id: str):
     print(f" Workspace: {workspace_id}")
     
     # Check for consolidation
+    from sqlalchemy import select, func
     from ekm.core.models import GKU
-    gku_count = ekm.storage.db.query(GKU).filter(GKU.workspace_id == uuid.UUID(workspace_id)).count()
+    result = await ekm.storage.db.execute(
+        select(func.count(GKU.id)).where(GKU.workspace_id == uuid.UUID(workspace_id))
+    )
+    gku_count = result.scalar()
     if gku_count == 0:
         print(f" [!] NOTE: Mesh is not yet consolidated. Retrieval may be slower and less 'causal'.")
         print(f"     Run 'python ekm_cli.py sleep --workspace {workspace_id}' to optimize.")
@@ -112,56 +121,57 @@ async def main():
     args = parser.parse_args()
     
     # Initialize EKM
-    from sqlalchemy import create_engine
-    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
     from ekm.core.models import Base
-    
-    db_url = "sqlite:///ekm.db"
-    engine = create_engine(db_url)
-    
-    # Ensure tables exist
-    Base.metadata.create_all(engine)
-    
+
+    db_url = "sqlite+aiosqlite:///ekm.db"
+    engine = create_async_engine(db_url)
+
+    # Ensure tables exist (run synchronously on async engine)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
     # Optimized config for CLI usage
     config = {
         "EKM_SEMANTIC_THRESHOLD": 0.70,  # Lowered from 0.82 for better recall
         "VECTOR_DIMENSION": 3072        # Optimized for modern embedding models
     }
-    
-    SessionLocal = sessionmaker(bind=engine)
-    db_session = SessionLocal()
-    
-    storage = SQLStorage(db=db_session)
-    
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key or api_key == "your_key_here":
-        print(" [!] Please set GEMINI_API_KEY environment variable.")
-        return
 
-    provider = GeminiProvider(api_key=api_key)
-    ekm = EKM(storage=storage, llm=provider, embeddings=provider, config=config)
+    SessionLocal = async_sessionmaker(bind=engine, class_=AsyncSession)
     
-    # Resolve workspace ID if present
-    workspace_id = None
-    if hasattr(args, 'workspace') and args.workspace:
-        workspace_id = await get_or_create_workspace(storage, args.workspace)
+    # Create async session
+    async with SessionLocal() as db_session:
+        storage = SQLStorage(db=db_session)
 
-    if args.command == "train":
-        await train_files(ekm, workspace_id, args.files)
-        print(f"\nDone. Use workspace ID: {args.workspace} (resolved to {workspace_id}) for chatting.")
-        
-    elif args.command == "chat":
-        await chat_loop(ekm, workspace_id)
-        
-    elif args.command == "sleep":
-        from ekm.core.consolidation import SleepConsolidator
-        consolidator = SleepConsolidator(storage, provider, provider)
-        print(f"Running sleep cycle for {workspace_id}...")
-        results = await consolidator.run_consolidation(workspace_id)
-        print(f"Consolidation complete: {results}")
-    
-    else:
-        parser.print_help()
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key or api_key == "your_key_here":
+            print(" [!] Please set GEMINI_API_KEY environment variable.")
+            return
+
+        provider = GeminiProvider(api_key=api_key)
+        ekm = EKM(storage=storage, llm=provider, embeddings=provider, config=config)
+
+        # Resolve workspace ID if present
+        workspace_id = None
+        if hasattr(args, 'workspace') and args.workspace:
+            workspace_id = await get_or_create_workspace(storage, args.workspace)
+
+        if args.command == "train":
+            await train_files(ekm, workspace_id, args.files)
+            print(f"\nDone. Use workspace ID: {args.workspace} (resolved to {workspace_id}) for chatting.")
+
+        elif args.command == "chat":
+            await chat_loop(ekm, workspace_id)
+
+        elif args.command == "sleep":
+            from ekm.core.consolidation import SleepConsolidator
+            consolidator = SleepConsolidator(storage, provider, provider)
+            print(f"Running sleep cycle for {workspace_id}...")
+            results = await consolidator.run_consolidation(workspace_id)
+            print(f"Consolidation complete: {results}")
+
+        else:
+            parser.print_help()
 
 if __name__ == "__main__":
     asyncio.run(main())

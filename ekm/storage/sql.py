@@ -1,8 +1,9 @@
 from typing import List, Dict, Any, Optional
-from sqlalchemy.orm import Session
-from sqlalchemy import and_, or_, text
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import and_, or_, text, select
 import uuid
 import json
+import logging
 import numpy as np
 from .base import BaseStorage
 from ..core.models import Workspace, Episode, AKU, AKURelationship, GKU
@@ -16,7 +17,7 @@ except ImportError:
     PGVECTOR_AVAILABLE = False
 
 class SQLStorage(BaseStorage):
-    def __init__(self, db: Session):
+    def __init__(self, db: AsyncSession):
         self.db = db
         from ..core.scalability import VectorIndexManager
         self.vector_index = VectorIndexManager(dimension=None)
@@ -40,7 +41,8 @@ class SQLStorage(BaseStorage):
         if isinstance(embedding, (bytes, bytearray)):
              try:
                  return json.loads(embedding.decode('utf-8'))
-             except:
+             except Exception as e:
+                 logging.warning(f"Failed to decode embedding bytes: {e}")
                  return []
         if isinstance(embedding, (list, tuple, np.ndarray)):
             return list(embedding)
@@ -61,7 +63,10 @@ class SQLStorage(BaseStorage):
         return data
 
     async def get_workspace(self, workspace_id: str) -> Dict[str, Any]:
-        workspace = self.db.query(Workspace).filter(Workspace.id == uuid.UUID(workspace_id)).first()
+        result = await self.db.execute(
+            select(Workspace).where(Workspace.id == uuid.UUID(workspace_id))
+        )
+        workspace = result.scalar_one_or_none()
         if not workspace:
             return None
         return {'id': str(workspace.id), 'name': workspace.name}
@@ -75,16 +80,17 @@ class SQLStorage(BaseStorage):
             metadata=metadata
         )
         self.db.add(episode)
-        self.db.commit()
-        
+        await self.db.commit()
+        await self.db.refresh(episode)  # Refresh to get ID if not already set
+
         # Update vector index if it's being used
-        if not PGVECTOR_AVAILABLE or not (self.db.bind.dialect.name == 'postgresql'):
+        if not PGVECTOR_AVAILABLE or not (self.db.get_bind().dialect.name == 'postgresql'):
              try:
                  emb_array = np.array([embedding]).astype('float32')
                  self.vector_index.add_vectors(emb_array, [str(episode.id)])
-             except:
-                 pass # Warning: Index update failed
-                 
+             except Exception as e:
+                 logging.warning(f"Vector index update failed for episode {episode.id}: {e}")
+
         return str(episode.id)
 
     async def save_akus(self, workspace_id: str, episode_id: Optional[str], akus: List[Dict[str, Any]]) -> List[str]:
@@ -99,7 +105,7 @@ class SQLStorage(BaseStorage):
             )
             self.db.add(aku)
             ids.append(aku)
-        self.db.commit()
+        await self.db.commit()
         return [str(a.id) for a in ids]
 
     async def save_relationships(self, workspace_id: str, relationships: List[Dict[str, Any]]):
@@ -114,33 +120,34 @@ class SQLStorage(BaseStorage):
                 edge_attributes=rel_data.get('edge_attributes', {})
             )
             self.db.add(rel)
-        self.db.commit()
+        await self.db.commit()
 
     async def find_similar_episodes(self, workspace_id: str, embedding: List[float], threshold: float, limit: int) -> List[Dict[str, Any]]:
         query_emb = self._serialize_embedding(embedding)
         
-        is_postgres = self.db.bind.dialect.name == 'postgresql'
-        
+        is_postgres = self.db.get_bind().dialect.name == 'postgresql'
+
         if PGVECTOR_AVAILABLE and is_postgres:
             # Use pgvector for similarity search
             embedding_array = np.array(query_emb).astype(np.float32).tolist()
-            
+
             # Using raw SQL for pgvector cosine similarity operator
             sql_query = text("""
-                SELECT id, content, summary, 
+                SELECT id, content, summary,
                        (embedding <=> :query_embedding) AS distance
-                FROM ekm_episodes 
+                FROM ekm_episodes
                 WHERE workspace_id = :workspace_id
                 ORDER BY distance ASC
                 LIMIT :limit
             """)
-            
-            results = self.db.execute(sql_query, {
+
+            result = await self.db.execute(sql_query, {
                 'query_embedding': json.dumps(embedding_array),
                 'workspace_id': uuid.UUID(workspace_id),
                 'limit': limit
-            }).fetchall()
-            
+            })
+            rows = result.fetchall()
+
             # Convert distance to similarity (1 / (1 + distance))
             return [
                 {
@@ -149,7 +156,7 @@ class SQLStorage(BaseStorage):
                     'summary': row[2],
                     'similarity': 1 / (1 + row[3])
                 }
-                for row in results
+                for row in rows
             ]
         else:
             # Fallback: using VectorIndexManager (FAISS/Memory)
@@ -157,7 +164,10 @@ class SQLStorage(BaseStorage):
             # Populate index if not already done (Lazy Loading)
             if not self._index_populated:
                 # Load all episodes for this workspace
-                all_episodes = self.db.query(Episode).filter(Episode.workspace_id == uuid.UUID(workspace_id)).all()
+                result = await self.db.execute(
+                    select(Episode).where(Episode.workspace_id == uuid.UUID(workspace_id))
+                )
+                all_episodes = result.scalars().all()
                 if all_episodes:
                     vectors = []
                     ids = []
@@ -187,7 +197,10 @@ class SQLStorage(BaseStorage):
                 return []
                 
             uuids = [uuid.UUID(i) for i in valid_ids]
-            episodes = self.db.query(Episode).filter(Episode.id.in_(uuids)).all()
+            result = await self.db.execute(
+                select(Episode).where(Episode.id.in_(uuids))
+            )
+            episodes = result.scalars().all()
             episode_map = {str(ep.id): ep for ep in episodes}
             
             for id_, dist in zip(ids, distances):
@@ -207,29 +220,30 @@ class SQLStorage(BaseStorage):
     async def find_similar_akus(self, workspace_id: str, embedding: List[float], threshold: float, limit: int) -> List[Dict[str, Any]]:
         query_emb = self._serialize_embedding(embedding)
         
-        is_postgres = self.db.bind.dialect.name == 'postgresql'
-        
+        is_postgres = self.db.get_bind().dialect.name == 'postgresql'
+
         if PGVECTOR_AVAILABLE and is_postgres:
             # Use pgvector for similarity search
             embedding_array = np.array(query_emb).astype(np.float32).tolist()
-            
+
             # Using raw SQL for pgvector cosine similarity operator
             sql_query = text("""
                 SELECT id, content, episode_id,
                        (embedding <=> :query_embedding) AS distance
-                FROM ekm_akus 
+                FROM ekm_akus
                 WHERE workspace_id = :workspace_id
                   AND is_archived = FALSE
                 ORDER BY distance ASC
                 LIMIT :limit
             """)
-            
-            results = self.db.execute(sql_query, {
+
+            result = await self.db.execute(sql_query, {
                 'query_embedding': json.dumps(embedding_array),
                 'workspace_id': uuid.UUID(workspace_id),
                 'limit': limit
-            }).fetchall()
-            
+            })
+            rows = result.fetchall()
+
             # Convert distance to similarity (1 / (1 + distance))
             return [
                 {
@@ -238,11 +252,17 @@ class SQLStorage(BaseStorage):
                     'episode_id': str(row[2]) if row[2] else None,
                     'similarity': 1 / (1 + row[3])
                 }
-                for row in results
+                for row in rows
             ]
         else:
             # Fallback to original method
-            akus = self.db.query(AKU).filter(AKU.workspace_id == uuid.UUID(workspace_id), AKU.is_archived == False).all()
+            result = await self.db.execute(
+                select(AKU).where(
+                    AKU.workspace_id == uuid.UUID(workspace_id),
+                    AKU.is_archived == False
+                )
+            )
+            akus = result.scalars().all()
             results = []
             for aku in akus:
                 if aku.embedding is not None:
@@ -259,12 +279,15 @@ class SQLStorage(BaseStorage):
 
     async def get_aku_relationships(self, workspace_id: str, aku_ids: List[str]) -> List[Dict[str, Any]]:
         uuids = [uuid.UUID(i) for i in aku_ids]
-        rels = self.db.query(AKURelationship).filter(
-            and_(
-                or_(AKURelationship.source_aku_id.in_(uuids), AKURelationship.target_aku_id.in_(uuids)),
-                AKURelationship.workspace_id == uuid.UUID(workspace_id)
+        result = await self.db.execute(
+            select(AKURelationship).where(
+                and_(
+                    or_(AKURelationship.source_aku_id.in_(uuids), AKURelationship.target_aku_id.in_(uuids)),
+                    AKURelationship.workspace_id == uuid.UUID(workspace_id)
+                )
             )
-        ).all()
+        )
+        rels = result.scalars().all()
         return [{
             'source_aku_id': str(r.source_aku_id),
             'target_aku_id': str(r.target_aku_id),
@@ -275,7 +298,13 @@ class SQLStorage(BaseStorage):
 
     async def get_akus_by_ids(self, aku_ids: List[str]) -> List[Dict[str, Any]]:
         uuids = [uuid.UUID(i) for i in aku_ids]
-        akus = self.db.query(AKU).filter(AKU.id.in_(uuids), AKU.is_archived == False).all()
+        result = await self.db.execute(
+            select(AKU).where(
+                AKU.id.in_(uuids),
+                AKU.is_archived == False
+            )
+        )
+        akus = result.scalars().all()
         return [{
             'id': str(a.id),
             'content': a.content,
@@ -286,9 +315,14 @@ class SQLStorage(BaseStorage):
 
     async def archive_akus(self, aku_ids: List[str]):
         """Mark AKUs as archived."""
+        from sqlalchemy import update
         uuids = [uuid.UUID(i) for i in aku_ids]
-        self.db.query(AKU).filter(AKU.id.in_(uuids)).update({AKU.is_archived: True}, synchronize_session=False)
-        self.db.commit()
+        await self.db.execute(
+            update(AKU)
+            .where(AKU.id.in_(uuids))
+            .values(is_archived=True)
+        )
+        await self.db.commit()
 
     async def save_gku(self, workspace_id: str, name: str, description: str = "", 
                       centroid_embedding: Optional[List[float]] = None, 
@@ -305,12 +339,16 @@ class SQLStorage(BaseStorage):
             cluster_metadata=self._standardize_data(cluster_metadata) if cluster_metadata else {}
         )
         self.db.add(gku)
-        self.db.commit()
+        await self.db.commit()
+        await self.db.refresh(gku)
         return str(gku.id)
 
     async def get_gku(self, gku_id: str) -> Optional[Dict[str, Any]]:
         """Get a specific GKU by ID."""
-        gku = self.db.query(GKU).filter(GKU.id == uuid.UUID(gku_id)).first()
+        result = await self.db.execute(
+            select(GKU).where(GKU.id == uuid.UUID(gku_id))
+        )
+        gku = result.scalar_one_or_none()
         if not gku:
             return None
         return {
@@ -326,7 +364,10 @@ class SQLStorage(BaseStorage):
 
     async def get_gkus_by_workspace(self, workspace_id: str) -> List[Dict[str, Any]]:
         """Get all GKUs for a specific workspace."""
-        gkus = self.db.query(GKU).filter(GKU.workspace_id == uuid.UUID(workspace_id)).all()
+        result = await self.db.execute(
+            select(GKU).where(GKU.workspace_id == uuid.UUID(workspace_id))
+        )
+        gkus = result.scalars().all()
         return [
             {
                 'id': str(g.id),
@@ -344,32 +385,33 @@ class SQLStorage(BaseStorage):
     async def associate_akus_with_gku(self, gku_id: str, aku_ids: List[str]):
         """Associate AKUs with a GKU."""
         from sqlalchemy import text
-        
+
         gku_uuid = uuid.UUID(gku_id)
         aku_uuids = [uuid.UUID(id) for id in aku_ids]
-        
+
         for aku_uuid in aku_uuids:
             # Check if association already exists
-            existing = self.db.execute(
+            result = await self.db.execute(
                 text("SELECT 1 FROM ekm_gku_akus WHERE gku_id = :gku_id AND aku_id = :aku_id"),
                 {"gku_id": str(gku_uuid), "aku_id": str(aku_uuid)}
-            ).fetchone()
-            
+            )
+            existing = result.fetchone()
+
             if not existing:
-                self.db.execute(
+                await self.db.execute(
                     text("INSERT INTO ekm_gku_akus (gku_id, aku_id) VALUES (:gku_id, :aku_id)"),
                     {"gku_id": str(gku_uuid), "aku_id": str(aku_uuid)}
                 )
-        
-        self.db.commit()
+
+        await self.db.commit()
 
     async def get_akus_in_gku(self, gku_id: str) -> List[Dict[str, Any]]:
         """Get all AKUs associated with a specific GKU."""
         from sqlalchemy import text
-        
+
         param_uuid = str(uuid.UUID(gku_id))
-        
-        results = self.db.execute(
+
+        result = await self.db.execute(
             text("""
             SELECT a.id, a.content, a.embedding, a.aku_metadata, a.created_at
             FROM ekm_akus a
@@ -377,8 +419,9 @@ class SQLStorage(BaseStorage):
             WHERE ga.gku_id = :gku_id
             """),
             {"gku_id": param_uuid}
-        ).fetchall()
-        
+        )
+        rows = result.fetchall()
+
         return [
             {
                 'id': str(row[0]),
@@ -387,18 +430,21 @@ class SQLStorage(BaseStorage):
                 'aku_metadata': row[3],
                 'created_at': row[4]
             }
-            for row in results
+            for row in rows
         ]
 
     async def get_akus_with_embeddings(self, workspace_id: str) -> List[Dict[str, Any]]:
         """Get all AKUs in a workspace that have embeddings."""
-        akus = self.db.query(AKU).filter(
-            and_(
-                AKU.workspace_id == uuid.UUID(workspace_id),
-                AKU.embedding.isnot(None),
-                AKU.is_archived == False
+        result = await self.db.execute(
+            select(AKU).where(
+                and_(
+                    AKU.workspace_id == uuid.UUID(workspace_id),
+                    AKU.embedding.isnot(None),
+                    AKU.is_archived == False
+                )
             )
-        ).all()
+        )
+        akus = result.scalars().all()
 
         return [
             {
@@ -415,30 +461,35 @@ class SQLStorage(BaseStorage):
 
     async def update_gku_pattern_signature(self, gku_id: str, pattern_signature: Dict[str, Any]):
         """Update the pattern signature of an existing GKU."""
-        gku = self.db.query(GKU).filter(GKU.id == uuid.UUID(gku_id)).first()
+        result = await self.db.execute(
+            select(GKU).where(GKU.id == uuid.UUID(gku_id))
+        )
+        gku = result.scalar_one_or_none()
         if gku:
             gku.pattern_signature = self._standardize_data(pattern_signature)
-            self.db.commit()
+            await self.db.commit()
 
     async def save_rl_state(self, model_id: str, weights: List[float], metadata: Optional[Dict[str, Any]] = None):
         """Save RL model weights and state for persistence across restarts."""
         from datetime import datetime
-        
+        from sqlalchemy import text
+
         # Use raw SQL to handle the RL state table (upsert pattern)
         # First, check if a row exists
-        existing = self.db.execute(
+        result = await self.db.execute(
             text("SELECT id FROM ekm_rl_state WHERE model_id = :model_id"),
             {"model_id": model_id}
-        ).fetchone()
-        
+        )
+        existing = result.fetchone()
+
         weights_json = json.dumps(self._standardize_data(weights))
         metadata_json = json.dumps(self._standardize_data(metadata)) if metadata else None
-        
+
         if existing:
             # Update existing
-            self.db.execute(
+            await self.db.execute(
                 text("""
-                    UPDATE ekm_rl_state 
+                    UPDATE ekm_rl_state
                     SET weights = :weights, rl_metadata = :metadata, updated_at = :updated_at
                     WHERE model_id = :model_id
                 """),
@@ -452,7 +503,7 @@ class SQLStorage(BaseStorage):
         else:
             # Insert new
             new_id = str(uuid.uuid4())
-            self.db.execute(
+            await self.db.execute(
                 text("""
                     INSERT INTO ekm_rl_state (id, model_id, weights, rl_metadata, created_at, updated_at)
                     VALUES (:id, :model_id, :weights, :metadata, :created_at, :updated_at)
@@ -466,21 +517,24 @@ class SQLStorage(BaseStorage):
                     "updated_at": datetime.utcnow()
                 }
             )
-        
-        self.db.commit()
+
+        await self.db.commit()
 
     async def load_rl_state(self, model_id: str) -> Optional[Dict[str, Any]]:
         """Load RL model weights and state."""
-        result = self.db.execute(
+        from sqlalchemy import text
+        
+        result = await self.db.execute(
             text("SELECT weights, rl_metadata, updated_at FROM ekm_rl_state WHERE model_id = :model_id"),
             {"model_id": model_id}
-        ).fetchone()
-        
-        if not result:
+        )
+        row = result.fetchone()
+
+        if not row:
             return None
-        
+
         return {
-            "weights": json.loads(result[0]) if result[0] else [],
-            "metadata": json.loads(result[1]) if result[1] else {},
-            "updated_at": result[2]
+            "weights": json.loads(row[0]) if row[0] else [],
+            "metadata": json.loads(row[1]) if row[1] else {},
+            "updated_at": row[2]
         }
