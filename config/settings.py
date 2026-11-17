@@ -8,8 +8,10 @@ class Settings:
     
     def __init__(self):
         self.database_url: str = os.getenv("DATABASE_URL", "sqlite:///./ekm.db")
-        self.llm_provider: str = os.getenv("LLM_PROVIDER", "openai")
-        self.embedding_provider: str = os.getenv("EMBEDDING_PROVIDER", "openai")
+        # Default: OpenRouter for both the LLM (Claude Haiku 5.5) and embeddings
+        self.llm_provider: str = os.getenv("LLM_PROVIDER", "openrouter")
+        self.embedding_provider: str = os.getenv("EMBEDDING_PROVIDER", "openrouter")
+        self.openrouter_api_key: Optional[str] = os.getenv("OPENROUTER_API_KEY")
         self.openai_api_key: Optional[str] = os.getenv("OPENAI_API_KEY")
         self.anthropic_api_key: Optional[str] = os.getenv("ANTHROPIC_API_KEY")
         self.cohere_api_key: Optional[str] = os.getenv("COHERE_API_KEY")

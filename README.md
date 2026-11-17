@@ -47,7 +47,7 @@ The Episodic Knowledge Mesh (EKM) is a cutting-edge knowledge management system 
 - **Batch Processing**: Efficient ingestion of large document collections
 
 ### 4. Retrieval System
-- **Multi-Modal Search**: Hybrid, episodic, and causal retrieval modes
+- **Multi-Modal Search**: Hybrid, episodic, and facts retrieval modes
 - **Context Awareness**: Focus buffer integration for conversational understanding
 - **RL Feedback**: Continuous improvement through user interaction learning
 - **Explainability**: Detailed reasoning for retrieval decisions
@@ -102,6 +102,7 @@ episodic_knowledge_mesh/
 │   │   ├── __init__.py
 │   │   ├── base.py                # Base provider classes
 │   │   ├── factory.py             # Provider factory
+│   │   ├── openrouter.py          # OpenRouter provider (default: LLM + embeddings)
 │   │   ├── openai.py              # OpenAI provider
 │   │   ├── google_genai.py        # Google GenAI provider
 │   │   ├── deepseek.py            # Deepseek provider
@@ -179,7 +180,7 @@ episodic_knowledge_mesh/
 ### Prerequisites
 - Python 3.11 or higher
 - pip package manager
-- An API key for your chosen LLM provider (OpenAI, Anthropic, etc.)
+- An [OpenRouter](https://openrouter.ai) API key. EKM uses OpenRouter for both the LLM (Claude Haiku 5.5 by default) and the embeddings (`openai/text-embedding-3-small` by default)
 
 ### Quick Setup
 1. Clone the repository:
@@ -215,18 +216,20 @@ episodic_knowledge_mesh/
 ### Basic Usage
 ```python
 import asyncio
-from ekm import EKM
-from ekm.storage.sql_storage import SQLStorage
-from ekm.providers.openai import OpenAIProvider
+from ekm.core.mesh import EKM
+from ekm.storage.memory import MemoryStorage
+from ekm.providers.openrouter import OpenRouterProvider
 
 async def main():
     # Initialize components
-    storage = SQLStorage("sqlite:///./ekm.db")
-    llm = OpenAIProvider(api_key="your-api-key")
-    embeddings = OpenAIProvider(api_key="your-api-key")
+    storage = MemoryStorage()
+    # One OpenRouter provider serves both roles. It reads OPENROUTER_API_KEY and
+    # uses anthropic/claude-haiku-5.5 + openai/text-embedding-3-small by default
+    # (override with OPENROUTER_LLM_MODEL / OPENROUTER_EMBEDDING_MODEL).
+    provider = OpenRouterProvider()
 
     # Create EKM instance
-    ekm = EKM(storage, llm, embeddings)
+    ekm = EKM(storage, llm=provider, embeddings=provider)
 
     # Train with some text
     workspace_id = "my_workspace"

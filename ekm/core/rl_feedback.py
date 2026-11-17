@@ -56,7 +56,10 @@ class RLFeedbackSystem:
         embeddings: BaseEmbeddings,
         learning_rate: float = 0.1,
         discount_factor: float = 0.9,
-        exploration_rate: float = 0.1,
+        # Off by default: random noise at serving time makes results
+        # non-deterministic, and the update rule learns only from the item
+        # that was rated, so the noise does not help it learn.
+        exploration_rate: float = 0.0,
         memory_size: int = 1000,
         model_id: str = None
     ):
@@ -94,6 +97,9 @@ class RLFeedbackSystem:
         # Other weights initialized to 0.0 or small values for cold start
         
         self._weights_loaded = False
+        # True once the weights reflect real feedback (recorded here or loaded
+        # from storage). Until then the reranker keeps the retrieval order.
+        self.has_learned = False
 
     async def load_weights(self):
         """Load model weights from persistent storage if available."""
@@ -107,6 +113,7 @@ class RLFeedbackSystem:
                 # Ensure weights match current feature count
                 if len(loaded_weights) == len(self.feature_names):
                     self.weights = loaded_weights
+                    self.has_learned = True
                     logger.info(f"Loaded RL weights for model '{self.model_id}' (last updated: {rl_state.get('updated_at')})")
                 else:
                     logger.warning(f"Loaded weights size mismatch ({len(loaded_weights)} vs {len(self.feature_names)}), using random init")
@@ -179,6 +186,7 @@ class RLFeedbackSystem:
             
             # Update model based on feedback
             await self._update_model(feedback_record)
+            self.has_learned = True
             
             logger.info(f"Recorded feedback for response {response_id}, rating: {user_rating}")
             return True
@@ -191,34 +199,61 @@ class RLFeedbackSystem:
         self,
         query: str,
         candidate_responses: List[Dict[str, Any]],
-        focus_buffer_state: Optional[Dict[str, float]] = None
+        focus_buffer_state: Optional[Dict[str, float]] = None,
+        query_embedding: Optional[List[float]] = None,
+        candidate_embeddings: Optional[Dict[str, Any]] = None
     ) -> RLPrediction:
         """
         Get ranked responses using the RL model with potential exploration.
-        
+
         Args:
             query: The query to rank responses for
             candidate_responses: List of candidate responses with metadata
             focus_buffer_state: Current state of focus buffer
-        
+            query_embedding: The query's embedding, if the caller already has
+                it (saves an embedding call)
+            candidate_embeddings: {response id: embedding} for responses whose
+                embedding the caller already has; others are embedded here
+
         Returns:
             RLPrediction with ranked responses and confidence scores
         """
         if not self._weights_loaded:
              await self.load_weights()
 
-        query_embedding = await self.embeddings.embed_query(query)
-        
+        if not self.has_learned:
+            # Cold start: the untrained weights would rank by query cosine
+            # alone, discarding the retrieval scores (GKU context, time,
+            # structure). Keep the retrieval order until feedback exists.
+            original = [self._original_score(r) for r in candidate_responses]
+            order = sorted(range(len(candidate_responses)), key=lambda i: original[i], reverse=True)
+            return RLPrediction(
+                ranked_responses=[candidate_responses[i] for i in order],
+                confidence_scores=[original[i] for i in order],
+                exploration_factor=0.0
+            )
+
+        if query_embedding is None:
+            query_embedding = await self.embeddings.embed_query(query)
+        if candidate_embeddings:
+            candidate_responses_for_features = [
+                {**r, 'embedding': candidate_embeddings[r.get('id')]}
+                if r.get('embedding') is None and r.get('id') in candidate_embeddings else r
+                for r in candidate_responses
+            ]
+        else:
+            candidate_responses_for_features = candidate_responses
+
         # Prepare RL state
         rl_state = RLState(
             query_embedding=query_embedding,
-            available_responses=candidate_responses,
+            available_responses=candidate_responses_for_features,
             focus_buffer_state=focus_buffer_state
         )
-        
+
         # Extract features for each response
         features_matrix = []
-        for response in candidate_responses:
+        for response in candidate_responses_for_features:
             features = await self._extract_features(rl_state, response)
             features_matrix.append(features)
         
@@ -267,7 +302,12 @@ class RLFeedbackSystem:
         
         # 1. Semantic similarity (cosine similarity between query and response)
         query_emb = np.array(rl_state.query_embedding)
-        resp_emb = np.array(response.get('embedding', await self.embeddings.embed_query(response.get('content', ''))))
+        # Embed only when the response has no usable embedding (the old
+        # `.get('embedding', await embed(...))` embedded every candidate,
+        # because the default is evaluated before .get runs).
+        resp_emb = self._as_vector(response.get('embedding'))
+        if resp_emb is None:
+            resp_emb = np.array(await self.embeddings.embed_query(response.get('content', '')))
         
         cos_sim = self._cosine_similarity(query_emb, resp_emb)
         features[0] = cos_sim
@@ -313,6 +353,32 @@ class RLFeedbackSystem:
         
         return features
     
+    @staticmethod
+    def _original_score(response: Dict[str, Any]) -> float:
+        """The score retrieval gave this response (same key order as RetrievalService's fallback sort)."""
+        value = response.get('score', response.get('semantic_similarity', 0.0))
+        try:
+            return float(value) if value is not None else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _as_vector(embedding: Any) -> Optional[np.ndarray]:
+        """Embedding as a 1-D float array (accepts lists, arrays and JSON strings); None if unusable."""
+        if embedding is None:
+            return None
+        if isinstance(embedding, str):
+            import json
+            try:
+                embedding = json.loads(embedding)
+            except ValueError:
+                return None
+        try:
+            vec = np.asarray(embedding, dtype=float).reshape(-1)
+        except (TypeError, ValueError):
+            return None
+        return vec if vec.size > 0 else None
+
     def _cosine_similarity(self, v1: np.ndarray, v2: np.ndarray) -> float:
         """Calculate cosine similarity between two vectors."""
         norm_v1 = np.linalg.norm(v1)
@@ -326,16 +392,16 @@ class RLFeedbackSystem:
         if len(all_responses) <= 1:
             return 1.0  # Fully diverse if it's the only response
         
-        resp_emb = np.array(response.get('embedding', []))
-        if len(resp_emb) == 0:
+        resp_emb = self._as_vector(response.get('embedding'))
+        if resp_emb is None:
             return 0.5  # Neutral if no embedding
-        
+
         # Calculate similarity to other responses
         similarities = []
         for other_resp in all_responses:
             if other_resp.get('id') != response.get('id'):
-                other_emb = np.array(other_resp.get('embedding', []))
-                if len(other_emb) > 0:
+                other_emb = self._as_vector(other_resp.get('embedding'))
+                if other_emb is not None and other_emb.shape == resp_emb.shape:
                     sim = self._cosine_similarity(resp_emb, other_emb)
                     similarities.append(sim)
         

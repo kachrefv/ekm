@@ -39,7 +39,7 @@ EKM follows a modular, layered architecture with clear separation of concerns:
 - Batch processing for efficient ingestion
 
 ### 4. Retrieval System
-- Multi-modal retrieval (hybrid, episodic, causal modes)
+- Multi-modal retrieval (hybrid, episodic, facts modes)
 - Hierarchical retrieval (GKU→AKU)
 - RL-based result reranking
 - Context-aware retrieval through focus buffers

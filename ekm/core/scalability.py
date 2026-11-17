@@ -123,16 +123,16 @@ class VectorIndexManager:
             # Use FAISS for indexing
             # If using IVF, train the index first if not already trained
             if isinstance(self.index, faiss.IndexIVF) and not self.is_trained:
-                if vectors.shape[0] < self.index.nlist:
-                    # Pad with copies if we don't have enough vectors to train
-                    needed = self.index.nlist - vectors.shape[0]
-                    extra_vectors = np.tile(vectors[0], (needed, 1)).astype('float32')
-                    train_vectors = np.vstack([vectors, extra_vectors])
+                # k-means needs roughly 39 points per list to give meaningful
+                # clusters. With fewer, use an exact Flat index instead: the old
+                # code padded the batch with copies of its first vector, so all
+                # centroids collapsed onto one point.
+                if self.index.ntotal == 0 and vectors.shape[0] < 39 * self.index.nlist:
+                    self.index = faiss.IndexFlatL2(self.dimension)
+                    self.index_type = "Flat"
                 else:
-                    train_vectors = vectors
-
-                self.index.train(train_vectors)
-                self.is_trained = True
+                    self.index.train(vectors)
+                    self.is_trained = True
 
             # Add vectors to index
             start_idx = self.index.ntotal
@@ -789,7 +789,11 @@ class ScalableEKMBackend:
         self.embeddings = embeddings
         
         # Initialize scalability components
+        # Kept for backward compatibility; fact search now uses one index per
+        # workspace (see get_workspace_index) so workspaces never mix.
         self.vector_index = VectorIndexManager(dimension=vector_dim)
+        self._workspace_indexes: Dict[str, VectorIndexManager] = {}
+        self._indexed_ids: Dict[str, set] = {}
         self.cache = CacheManager(max_size=cache_size)
         self.graph_manager = OptimizedGraphManager()
         self.memory_manager = MemoryManager()
@@ -799,9 +803,96 @@ class ScalableEKMBackend:
         self.async_manager = AsyncProcessingManager(max_concurrent_tasks=5)
         self.pattern_extractor = ParallelPatternExtractor(num_processes=4)
     
+    @staticmethod
+    def _unit_vectors(embeddings: List[Any]) -> Tuple[np.ndarray, List[int]]:
+        """Rows normalised to length 1 (so L2 distance maps to cosine), and the
+        positions of the inputs that were usable (non-empty, non-zero)."""
+        rows, kept = [], []
+        for i, emb in enumerate(embeddings):
+            if emb is None:
+                continue
+            if isinstance(emb, str):
+                import json
+                emb = json.loads(emb)
+            vec = np.asarray(emb, dtype=np.float32).reshape(-1)
+            norm = float(np.linalg.norm(vec))
+            if vec.size == 0 or norm == 0:
+                continue
+            rows.append(vec / norm)
+            kept.append(i)
+        if not rows:
+            return np.empty((0, 0), dtype=np.float32), []
+        return np.vstack(rows), kept
+
+    async def get_workspace_index(self, workspace_id: str) -> VectorIndexManager:
+        """
+        The fact index for one workspace. Built from storage on first use, so it
+        survives restarts and only ever contains that workspace's active facts.
+        Uses an exact (Flat) index: the default IVF index was trained on the first
+        batch padded with copies of one vector, which made its clusters meaningless.
+        """
+        index = self._workspace_indexes.get(workspace_id)
+        if index is None:
+            index = VectorIndexManager(dimension=None, index_type="Flat")
+            ids = set()
+            akus = await self.storage.get_akus_with_embeddings(workspace_id)
+            vectors, kept = self._unit_vectors([a.get('embedding') for a in akus])
+            if kept:
+                kept_ids = [str(akus[i]['id']) for i in kept]
+                index.add_vectors(vectors, kept_ids)
+                ids.update(kept_ids)
+            self._workspace_indexes[workspace_id] = index
+            self._indexed_ids[workspace_id] = ids
+        return index
+
+    def invalidate_workspace_index(self, workspace_id: str) -> None:
+        """Drop a workspace's index so it is rebuilt from storage on next use
+        (call after consolidation archives or merges facts)."""
+        self._workspace_indexes.pop(workspace_id, None)
+        self._indexed_ids.pop(workspace_id, None)
+
+    async def index_akus(self, workspace_id: str, aku_ids: List[str], embeddings: List[Any]) -> int:
+        """
+        Add facts that are already saved in storage to the workspace index.
+        Does not save or embed anything. Returns how many were newly indexed.
+        """
+        index = await self.get_workspace_index(workspace_id)
+        known = self._indexed_ids[workspace_id]
+        pending = [(str(i), e) for i, e in zip(aku_ids, embeddings) if str(i) not in known]
+        if not pending:
+            return 0
+        vectors, kept = self._unit_vectors([e for _, e in pending])
+        if not kept:
+            return 0
+        new_ids = [pending[i][0] for i in kept]
+        index.add_vectors(vectors, new_ids)
+        known.update(new_ids)
+        return len(new_ids)
+
+    async def search_similar_akus(
+        self, workspace_id: str, embedding: Any, k: int = 10
+    ) -> List[Tuple[str, float]]:
+        """(fact id, cosine similarity) for the k facts in the workspace closest to `embedding`."""
+        index = await self.get_workspace_index(workspace_id)
+        query, kept = self._unit_vectors([embedding])
+        if not kept or index.dimension is None:
+            return []
+        distances, ids = index.search(query[0], k)
+        results = []
+        for dist, aku_id in zip(distances, ids):
+            if aku_id is None:
+                continue
+            # FAISS IndexFlatL2 returns squared L2: on unit vectors d = 2 - 2cos.
+            # The numpy fallback returns 1 - cos.
+            cosine = 1.0 - float(dist) / 2.0 if FAISS_AVAILABLE else 1.0 - float(dist)
+            results.append((aku_id, cosine))
+        return results
+
     async def add_akus_batch(self, workspace_id: str, aku_data: List[Dict[str, Any]]) -> List[str]:
         """
-        Add AKUs in batch with vector indexing.
+        Embed, save and index NEW AKUs (content only; no episode link).
+        Do not call this for AKUs that are already saved: it would store them a
+        second time. Use index_akus for those.
         """
         # Process embeddings in batch
         contents = [aku['content'] for aku in aku_data]
@@ -818,11 +909,10 @@ class ScalableEKMBackend:
         
         # Store in database
         aku_ids = await self.storage.save_akus(workspace_id, None, akus_to_store)
-        
-        # Add to vector index
-        embedding_array = np.array(embeddings_list).astype('float32')
-        self.vector_index.add_vectors(embedding_array, aku_ids)
-        
+
+        # Add to this workspace's vector index
+        await self.index_akus(workspace_id, aku_ids, embeddings_list)
+
         return aku_ids
     
     async def search_akus(
@@ -848,25 +938,22 @@ class ScalableEKMBackend:
 
         # Get query embedding
         query_embedding = await self.embeddings.embed_query(query)
-        query_array = np.array(query_embedding).astype('float32')
 
-        # Search using vector index
-        distances, aku_ids = self.vector_index.search(query_array, top_k)
+        # Search this workspace's index only
+        matches = await self.search_similar_akus(workspace_id, query_embedding, top_k)
 
-        # Filter out None IDs and get full AKU details
+        # Get full AKU details
         valid_results = []
-        for dist, aku_id in zip(distances, aku_ids):
-            if aku_id is not None:
-                # Get AKU details from storage
-                aku_details = await self.storage.get_akus_by_ids([aku_id])
-                if aku_details:
-                    aku_info = aku_details[0]
-                    valid_results.append({
-                        'id': aku_info['id'],
-                        'content': aku_info['content'],
-                        'distance': float(dist),
-                        'similarity': float(1 / (1 + dist))  # Convert distance to similarity
-                    })
+        for aku_id, cosine in matches:
+            aku_details = await self.storage.get_akus_by_ids([aku_id])
+            if aku_details:
+                aku_info = aku_details[0]
+                valid_results.append({
+                    'id': aku_info['id'],
+                    'content': aku_info['content'],
+                    'distance': 1.0 - cosine,
+                    'similarity': cosine
+                })
 
         # Cache the results (without pagination applied)
         self.cache.set(cache_key, valid_results)

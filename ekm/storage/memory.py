@@ -122,6 +122,7 @@ class MemoryStorage(BaseStorage):
                         'id': episode['id'],
                         'summary': episode['summary'],
                         'content': episode['content'],
+                        'created_at': episode.get('created_at'),
                         'similarity': sim
                     })
         
@@ -259,22 +260,33 @@ class MemoryStorage(BaseStorage):
                     aku['associated_gkus'].append(gku_id)
 
     async def get_akus_in_gku(self, gku_id: str) -> List[Dict[str, Any]]:
-        """Get all AKUs associated with a specific GKU."""
+        """Active (non-archived) AKUs associated with a GKU."""
         results = []
-        
+
         for aku in self.akus.values():
-            if ('associated_gkus' in aku and 
-                gku_id in aku['associated_gkus']):
+            if ('associated_gkus' in aku and
+                gku_id in aku['associated_gkus'] and
+                not aku.get('is_archived')):
                 
                 results.append({
                     'id': aku.get('id'),
                     'content': aku.get('content'),
                     'embedding': aku.get('embedding'),
                     'aku_metadata': aku.get('aku_metadata', {}),
+                    'episode_id': aku.get('episode_id'),
                     'created_at': aku.get('created_at')
                 })
-        
+
         return results
+
+    async def get_gku_ids_for_akus(self, workspace_id: str, aku_ids: List[str]) -> Dict[str, List[str]]:
+        """{aku_id: [GKU ids containing it]} for the given AKUs."""
+        membership = {}
+        for aku_id in aku_ids:
+            aku = self.akus.get(aku_id)
+            if aku and aku.get('workspace_id') == workspace_id and aku.get('associated_gkus'):
+                membership[aku_id] = list(aku['associated_gkus'])
+        return membership
 
     async def get_akus_with_embeddings(self, workspace_id: str) -> List[Dict[str, Any]]:
         """Get all AKUs in a workspace that have embeddings."""

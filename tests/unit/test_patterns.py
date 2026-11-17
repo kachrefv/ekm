@@ -295,6 +295,45 @@ class TestPatternSimilarity:
         # Should handle gracefully
         assert isinstance(similarity, (int, float))
 
+    def test_pattern_similarity_ignores_graph_size(self):
+        """A small and a large chain have the same shape, so they should match."""
+        from scipy.sparse import lil_matrix
+        from ekm.core.patterns import (calculate_pattern_similarity, count_graphlets,
+                                       compute_random_walk_patterns, compute_degree_statistics)
+
+        def chain(n):
+            adj = lil_matrix((n, n), dtype=np.float32)
+            for i in range(n - 1):
+                adj[i, i + 1] = adj[i + 1, i] = 1
+            return {'graphlets': count_graphlets(adj),
+                    'random_walks': compute_random_walk_patterns(adj),
+                    'degree_stats': compute_degree_statistics(adj)}
+
+        def clique(n):
+            adj = lil_matrix(np.ones((n, n), dtype=np.float32) - np.eye(n, dtype=np.float32))
+            return {'graphlets': count_graphlets(adj),
+                    'random_walks': compute_random_walk_patterns(adj),
+                    'degree_stats': compute_degree_statistics(adj)}
+
+        same_shape = calculate_pattern_similarity(chain(4), chain(50))
+        different_shape = calculate_pattern_similarity(chain(4), clique(4))
+
+        assert same_shape > different_shape
+
+    def test_pattern_similarity_cluster_and_query_formats_match(self):
+        """Cluster signatures share keys with query signatures, so graphlets are compared."""
+        from ekm.core.knowledge.organization import extract_enhanced_pattern_signature
+        from ekm.core.patterns import _triangle_share
+
+        np.random.seed(0)
+        center = np.random.randn(16)
+        embeddings = np.stack([center + 0.05 * np.random.randn(16) for _ in range(6)])
+        signature = extract_enhanced_pattern_signature(embeddings, np.zeros(6, dtype=int), 0)
+
+        # Near-identical embeddings form a clique: every connected triple is a triangle
+        assert _triangle_share(signature['graphlets']) == 1.0
+        assert 'return_probability' in signature['random_walks']
+
 
 class TestPatternStorageIntegration:
     """Tests for pattern storage integration."""

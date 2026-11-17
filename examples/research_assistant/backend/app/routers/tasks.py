@@ -13,7 +13,6 @@ from ekm.core.agent import EKMAgent
 from ekm.core.task_manager import TaskManager
 from ekm.utils.document_loader import DocumentLoader
 from ekm.core.consolidation import SleepConsolidator
-from ekm.providers.gemini import GeminiProvider
 
 from ..models import TaskCreateRequest, TaskResponse, DeepResearchRequest
 from ..core.dependencies import get_ekm_instance, get_db, SessionLocal
@@ -59,9 +58,7 @@ async def sleep_cycle(workspace_id: str, db: AsyncSession = Depends(get_db)):
     
     # We might need a separate provider instance if we want specific config, 
     # but EKM instance already has one.
-    # Original server.py created a NEW GeminiProvider here using the env key.
-    # We should reuse the EKM's provider if possible, or create new one if needed for separation.
-    # reusing ekm.llm/ekm.embeddings seems safer for resource usage.
+    # Reuse the EKM's OpenRouter provider (ekm.llm / ekm.embeddings).
     
     # For consolidation, we need a provider.
     consolidator = SleepConsolidator(ekm.storage, ekm.llm, ekm.embeddings)

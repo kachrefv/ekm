@@ -10,12 +10,11 @@ from typing import List
 from ekm.core.mesh import EKM
 from ekm.core.agent import EKMAgent
 from ekm.storage.sql import SQLStorage
-from ekm.providers.gemini import GeminiProvider
+from ekm.providers.openrouter import OpenRouterProvider
 from ekm.providers.base import BaseLLM, BaseEmbeddings
 from ekm.utils.document_loader import DocumentLoader
 
-# Configuration (In a real app, these would come from env vars or config file)
-os.environ.setdefault("GEMINI_API_KEY", "AIzaSyAMyVC0P6mLcZZ4aQ8KyA4ByAXVxPDuQ5E")
+# Credentials come from the environment (OPENROUTER_API_KEY); never hardcode keys here.
 
 async def get_or_create_workspace(storage: SQLStorage, name: str) -> str:
     """Resolve a human-readable name to a UUID string."""
@@ -73,7 +72,7 @@ async def chat_loop(ekm: EKM, workspace_id: str):
     )
     gku_count = result.scalar()
     if gku_count == 0:
-        print(f" [!] NOTE: Mesh is not yet consolidated. Retrieval may be slower and less 'causal'.")
+        print(f" [!] NOTE: Mesh is not yet consolidated. Facts are found by direct search only, without cluster context.")
         print(f"     Run 'python ekm_cli.py sleep --workspace {workspace_id}' to optimize.")
     
     print(f"{'='*60}\n")
@@ -134,7 +133,7 @@ async def main():
     # Optimized config for CLI usage
     config = {
         "EKM_SEMANTIC_THRESHOLD": 0.70,  # Lowered from 0.82 for better recall
-        "VECTOR_DIMENSION": 3072        # Optimized for modern embedding models
+        # VECTOR_DIMENSION is left unset: it is detected from the embedding model
     }
 
     SessionLocal = async_sessionmaker(bind=engine, class_=AsyncSession)
@@ -143,12 +142,14 @@ async def main():
     async with SessionLocal() as db_session:
         storage = SQLStorage(db=db_session)
 
-        api_key = os.environ.get("GEMINI_API_KEY")
-        if not api_key or api_key == "your_key_here":
-            print(" [!] Please set GEMINI_API_KEY environment variable.")
+        api_key = os.environ.get("OPENROUTER_API_KEY")
+        if not api_key or api_key.startswith("your-"):
+            print(" [!] Please set the OPENROUTER_API_KEY environment variable.")
             return
 
-        provider = GeminiProvider(api_key=api_key)
+        # Claude Haiku 5.5 for the LLM and an OpenRouter embedding model, both via
+        # OpenRouter (override with OPENROUTER_LLM_MODEL / OPENROUTER_EMBEDDING_MODEL)
+        provider = OpenRouterProvider(api_key=api_key)
         ekm = EKM(storage=storage, llm=provider, embeddings=provider, config=config)
 
         # Resolve workspace ID if present

@@ -104,9 +104,9 @@ The adaptive weighting system includes:
 class AdaptiveHeadWeighting:
     def __init__(self):
         self.head_weights = {
-            'semantic': 0.4,
-            'structural': 0.4,
-            'temporal': 0.2
+            'semantic': 0.6,     # the only validated signal, so it dominates
+            'structural': 0.25,
+            'temporal': 0.15
         }
         self.performance_history = {...}
         self.learning_rate = 0.01

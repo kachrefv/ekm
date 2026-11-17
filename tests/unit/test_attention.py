@@ -158,8 +158,20 @@ class TestSemanticRetrievalHead:
         query_embedding = np.random.randn(64).astype(np.float32)
         
         scores = head.compute_attention(query_embedding, [])
-        
+
         assert scores.size == 0
+
+    def test_semantic_head_returns_raw_cosine(self):
+        """Scores are cosine similarities, not a near-uniform softmax."""
+        from ekm.core.attention import SemanticRetrievalHead
+
+        head = SemanticRetrievalHead(embedding_dim=2)
+        query = np.array([1.0, 0.0])
+        gkus = [np.array([1.0, 0.0]), np.array([0.0, 1.0]), np.array([-1.0, 0.0])]
+
+        scores = head.compute_attention(query, gkus)
+
+        assert np.allclose(scores, [1.0, 0.0, -1.0])
 
 
 class TestStructuralRetrievalHead:
@@ -275,6 +287,46 @@ class TestAdaptiveHeadWeighting:
         
         # Weights should have changed
         assert updated_weights != initial_weights
+
+    def test_first_update_moves_gradually_from_configured_weights(self):
+        """Momentum applies from the first update instead of replacing the weights."""
+        from ekm.core.attention import AdaptiveHeadWeighting
+
+        weighting = AdaptiveHeadWeighting({'semantic': 0.4, 'structural': 0.4, 'temporal': 0.2})
+        weighting.update_weights_based_on_query(
+            np.zeros(4), None, None, {'semantic': 1.0, 'structural': 0.0, 'temporal': 0.0})
+
+        weights = weighting.get_current_weights()
+        assert weights['semantic'] == pytest.approx(0.9 * 0.4 + 0.1 * 1.0)
+        assert weights['structural'] == pytest.approx(0.9 * 0.4)
+        assert np.isclose(sum(weights.values()), 1.0)
+
+    @pytest.mark.asyncio
+    async def test_retrieval_does_not_invent_feedback(self):
+        """Weights change only through real feedback, and a shared weighting is used."""
+        from unittest.mock import AsyncMock, MagicMock
+        from ekm.core.attention import AdaptiveHeadWeighting, QKVAttentionRetriever
+
+        weighting = AdaptiveHeadWeighting()
+        weighting.update_weights_based_on_query(
+            np.zeros(2), None, None, {'semantic': 1.0, 'structural': 0.0, 'temporal': 0.0})
+        learned = weighting.get_current_weights()
+
+        storage = MagicMock()
+        storage.get_gkus_by_workspace = AsyncMock(return_value=[
+            {'id': 'g1', 'centroid_embedding': [1.0, 0.0], 'pattern_signature': {},
+             'cluster_metadata': {}, 'created_at': 1000.0},
+        ])
+        storage.get_akus_in_gku = AsyncMock(return_value=[])
+        retriever = QKVAttentionRetriever(embedding_dim=2, use_adaptive_weights=True,
+                                          adaptive_weighting=weighting)
+
+        for _ in range(5):
+            await retriever.retrieve(storage, 'ws', [1.0, 0.0], query_pattern={},
+                                     query_time_context={'timestamp': 1000.0}, top_k=1)
+
+        assert retriever.head_weights == learned
+        assert weighting.get_current_weights() == learned
 
 
 class TestAttentionContainers:

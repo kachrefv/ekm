@@ -20,6 +20,33 @@ from .patterns import (
 
 logger = logging.getLogger(__name__)
 
+# Words that carry no meaning in a relation name ("was born in" -> "born")
+_RELATION_STOPWORDS = {
+    'a', 'an', 'the', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'of', 'in', 'on',
+    'at', 'to', 'for', 'by', 'with', 'from', 'as', 'has', 'have', 'had', 'its', 'their', 'and'
+}
+
+
+def normalize_relation_label(label: Any) -> str:
+    """Lower-case content words of a relation name, e.g. 'Was Born In' -> 'born'.
+    Empty string when nothing meaningful is left."""
+    if not isinstance(label, str):
+        return ''
+    words = [w for w in re.findall(r'[a-z]+', label.lower()) if w not in _RELATION_STOPWORDS]
+    return ' '.join(words)
+
+
+def relation_label_set(edges: List[Any]) -> List[str]:
+    """Sorted distinct normalized relation names from [src, tgt, label] edges
+    (a sorted list rather than a set so the signature stays JSON-serializable)."""
+    labels = set()
+    for edge in edges or []:
+        if isinstance(edge, (list, tuple)) and len(edge) >= 3:
+            normalized = normalize_relation_label(edge[2])
+            if normalized:
+                labels.add(normalized)
+    return sorted(labels)
+
 class QueryGraphExtractor:
     """
     Extracts graph structures from natural language queries to enable
@@ -40,37 +67,54 @@ class QueryGraphExtractor:
         Returns:
             Dict containing the pattern signature of the query graph
         """
+        signature = await self.extract_text_pattern(query, label="QUERY")
+        if signature is None:
+            logger.warning(f"Could not extract graph from query: '{query}'")
+            return self._get_empty_pattern()
+        return signature
+
+    async def extract_text_pattern(self, text: str, label: str = "QUERY") -> Optional[Dict[str, Any]]:
+        """
+        Extracts an entity-relation graph from any text and computes its pattern signature.
+
+        Used for both queries and GKUs (the facts in a cluster), so the two sides of
+        the structural head are built the same way: same extraction prompt, same
+        graph type (entities linked by relations), same feature functions.
+
+        Args:
+            text: Query or fact text
+            label: Name shown to the LLM for the text ("QUERY", "FACTS", ...)
+
+        Returns:
+            Pattern signature, or None if no graph could be extracted
+        """
         # 1. Extract entities and relationships using LLM with Chain-of-Thought reasoning
-        graph_data = await self._extract_graph_from_text_cot(query)
+        graph_data = await self._extract_graph_from_text_cot(text, label=label)
 
         # 2. Convert to adjacency matrix
         adj_matrix, node_map = self._build_adjacency_matrix(graph_data)
 
         if adj_matrix.shape[0] == 0:
-            logger.warning(f"Could not extract graph from query: '{query}'")
-            return self._get_empty_pattern()
+            return None
 
         # 3. Compute pattern signature using patterns.py
-        # We use a dummy embedding for semantic centroids as we don't have node embeddings here
-        # or we could potentially embed the entity names if we had the embedder.
-        # For now, we'll skip semantic centroids for the query pattern or use placeholders.
-
         try:
-            graphlets = count_graphlets(adj_matrix)
-            random_walks = compute_random_walk_patterns(adj_matrix)
-            degree_stats = compute_degree_statistics(adj_matrix)
-
             return {
-                'graphlets': graphlets,
-                'random_walks': random_walks,
-                'degree_stats': degree_stats,
-                # 'semantic_centroids': ... # Optional, requires embedding service
+                'graphlets': count_graphlets(adj_matrix),
+                'random_walks': compute_random_walk_patterns(adj_matrix),
+                'degree_stats': compute_degree_statistics(adj_matrix),
+                'graph_properties': {
+                    'num_nodes': int(adj_matrix.shape[0]),
+                    'num_edges': int(adj_matrix.nnz // 2) if hasattr(adj_matrix, 'nnz') else 0
+                },
+                # What the edges mean, not just their shape
+                'relation_labels': relation_label_set(graph_data.get('edges', []))
             }
         except Exception as e:
-            logger.error(f"Error computing patterns for query graph: {e}")
-            return self._get_empty_pattern()
+            logger.error(f"Error computing patterns for {label.lower()} graph: {e}")
+            return None
 
-    async def _extract_graph_from_text_cot(self, text: str) -> Dict[str, List[Any]]:
+    async def _extract_graph_from_text_cot(self, text: str, label: str = "QUERY") -> Dict[str, List[Any]]:
         """Uses Chain-of-Thought reasoning to parse text into nodes and edges."""
 
         system_prompt = """You are a graph extraction expert who thinks step-by-step to ensure accurate identification of entities and relationships.
@@ -83,9 +127,9 @@ class QueryGraphExtractor:
         """
 
         cot_user_prompt = f"""
-        Analyze the query step-by-step to extract a graph structure:
+        Analyze the text step-by-step to extract a graph structure:
 
-        QUERY: {text}
+        {label}: {text}
 
         CHAIN-OF-THOUGHT REASONING:
         1. ENTITY IDENTIFICATION:

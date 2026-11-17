@@ -7,6 +7,47 @@ from typing import List, Dict, Any, Optional
 from ...providers.base import BaseLLM, BaseEmbeddings
 from .. import prompts
 
+_ISO_DATE = re.compile(r'^\d{4}(-\d{2}(-\d{2})?)?$')
+
+
+def normalize_event_time(value: Any) -> Optional[str]:
+    """An ISO date the LLM gave for a fact ('YYYY', 'YYYY-MM' or 'YYYY-MM-DD',
+    optionally with a time), returned as an ISO string; None for anything else."""
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value or value.lower() in ('null', 'none', 'unknown', 'n/a'):
+        return None
+    from datetime import datetime
+    if _ISO_DATE.match(value):
+        parts = value.split('-')
+        try:
+            # Partial dates are anchored at the start of their year/month
+            return datetime(int(parts[0]), int(parts[1]) if len(parts) > 1 else 1,
+                            int(parts[2]) if len(parts) > 2 else 1).date().isoformat()
+        except ValueError:
+            return None
+    try:
+        return datetime.fromisoformat(value.replace('Z', '+00:00')).isoformat()
+    except ValueError:
+        return None
+
+
+def _split_fact_times(raw_facts: Any) -> tuple:
+    """Accepts facts as plain strings (old format) or {"fact": ..., "when": ...}
+    objects (new format). Returns (fact strings, aligned ISO dates or None)."""
+    facts, times = [], []
+    for item in raw_facts if isinstance(raw_facts, list) else []:
+        if isinstance(item, dict):
+            text = item.get('fact') or item.get('content') or item.get('text')
+            when = normalize_event_time(item.get('when'))
+        else:
+            text, when = item, None
+        if isinstance(text, str) and text.strip():
+            facts.append(text.strip())
+            times.append(when)
+    return facts, times
+
 
 class KnowledgeExtractor:
     """Handles extraction of Atomic Knowledge Units (AKUs) and summaries."""
@@ -36,9 +77,11 @@ class KnowledgeExtractor:
             if json_match:
                 json_str = json_match.group(0)
                 parsed = json.loads(json_str)
+                facts, fact_times = _split_fact_times(parsed.get('facts', []))
                 return {
                     'summary': parsed.get('summary', ''),
-                    'facts': parsed.get('facts', [])
+                    'facts': facts,             # list of strings, as before
+                    'fact_times': fact_times    # aligned: ISO date string or None
                 }
         except:
             pass
@@ -55,7 +98,8 @@ class KnowledgeExtractor:
 
         return {
             'summary': response[:200] + "..." if len(response) > 200 else response,
-            'facts': facts
+            'facts': facts,
+            'fact_times': [None] * len(facts)
         }
 
     async def extract_akus(self, text: str) -> List[str]:

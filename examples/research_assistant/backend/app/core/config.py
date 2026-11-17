@@ -1,14 +1,18 @@
 import os
 
+from ekm.providers.openrouter import DEFAULT_EMBEDDING_MODEL, DEFAULT_LLM_MODEL
+
+
 class Settings:
     DB_URL = os.environ.get("EKM_DB_URL", "sqlite+aiosqlite:///ekm.db")
-    # SECURITY NOTE: In production, this must be set via environment variable. 
-    # Fallback is only for local dev convenience if user hasn't set it yet.
-    GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") 
-    
+    # Set via environment variable; never hardcode keys.
+    OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+    OPENROUTER_LLM_MODEL = os.environ.get("OPENROUTER_LLM_MODEL", DEFAULT_LLM_MODEL)
+    OPENROUTER_EMBEDDING_MODEL = os.environ.get("OPENROUTER_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL)
+
+    # VECTOR_DIMENSION is left unset: it is detected from the embedding model
     DEFAULT_EKM_CONFIG = {
         "EKM_SEMANTIC_THRESHOLD": 0.70,
-        "VECTOR_DIMENSION": 3072,
         "EKM_MIN_CHUNK_SIZE": 512,
         "EKM_MAX_CHUNK_SIZE": 2048,
         "RL_LEARNING_RATE": 0.1

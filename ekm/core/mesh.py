@@ -2,7 +2,6 @@ import asyncio
 from typing import List, Dict, Any, Optional
 from .state import FocusBuffer
 from .scalability import ScalableEKMBackend
-from .advanced_embeddings import MultiModalEmbedder, EnhancedEmbeddingProvider
 from .rl_feedback import RLFeedbackSystem
 from .training import TrainingService
 from .attention.mechanisms import MultiHeadAttention, SparseAttention
@@ -54,6 +53,9 @@ class EKM:
             # Check if we should use enhanced embeddings based on config
             use_enhanced_embeddings = self.config.get("USE_ENHANCED_EMBEDDINGS", False)
             if use_enhanced_embeddings:
+                # Imported here: it needs torch, sentence-transformers and
+                # transformers, which only this optional feature uses.
+                from .advanced_embeddings import MultiModalEmbedder, EnhancedEmbeddingProvider
                 domain_model = self.config.get("DOMAIN_MODEL_NAME", None)
                 self.enhanced_embedder = MultiModalEmbedder(
                     model_name=self.config.get("BASE_EMBEDDING_MODEL", "all-MiniLM-L6-v2"),
@@ -85,7 +87,7 @@ class EKM:
             llm=llm,
             embeddings=embeddings,
             learning_rate=self.config.get("RL_LEARNING_RATE", 0.1),
-            exploration_rate=self.config.get("RL_EXPLORATION_RATE", 0.1),
+            exploration_rate=self.config.get("RL_EXPLORATION_RATE", 0.0),  # opt-in: adds random noise to rankings
             memory_size=self.config.get("RL_MEMORY_SIZE", 1000)
         )
         
@@ -126,12 +128,12 @@ class EKM:
             top_k: Number of results to return
             focus_buffer: Optional focus buffer for context
             use_rl_feedback: Enable RL-based reranking
-            use_sparse_attention: Use sparse attention for efficiency
-            use_adaptive_weights: Use adaptive head weighting
-            use_hierarchical_attention: Use hierarchical attention
+            use_sparse_attention: Ignored; kept for API compatibility
+            use_adaptive_weights: Read head weights from the shared adaptive weighting
+            use_hierarchical_attention: Select at least 5 GKUs instead of exactly top_k
             layers: Which layers to retrieve from ('episodic', 'aku', 'gku')
             debug_mode: If True, include detailed attention debug info in response
-            mode: Retrieval mode ('hybrid', 'episodic', or 'causal')
+            mode: Retrieval mode ('hybrid', 'episodic', or 'facts'; 'causal' is a deprecated alias for 'facts')
         
         Returns:
             Dict with 'results' and 'metadata'. If debug_mode=True, also includes 'debug_info'.

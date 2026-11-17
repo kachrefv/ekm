@@ -161,7 +161,7 @@ config = {
     'USE_ADAPTIVE_WEIGHTS': True,       # Enable adaptive head weighting
     'USE_HIERARCHICAL_ATTENTION': True, # Enable hierarchical attention
     'RL_LEARNING_RATE': 0.1,            # Learning rate for RL system
-    'RL_EXPLORATION_RATE': 0.1,         # Exploration rate for RL system
+    'RL_EXPLORATION_RATE': 0.0,         # Chance of adding random noise to a ranking (off by default)
     'RL_MEMORY_SIZE': 1000              # Memory size for RL system
 }
 
@@ -272,16 +272,16 @@ For production environments:
 ```python
 from ekm import create_ekm_with_sql_storage
 from sqlalchemy import create_engine
-from ekm.providers.openai import OpenAILLM, OpenAIEmbeddings
+from ekm.providers.openrouter import OpenRouterProvider
 
 # Setup database engine
 engine = create_engine("postgresql://user:password@localhost/dbname")
 session = engine.connect()
 
-# Initialize with SQL storage
-llm = OpenAILLM(api_key="your-api-key")
-embeddings = OpenAIEmbeddings(api_key="your-api-key")
-ekm = create_ekm_with_sql_storage(session, llm, embeddings)
+# Initialize with SQL storage. OpenRouter serves both the LLM (Claude Haiku 5.5)
+# and the embeddings; it reads OPENROUTER_API_KEY from the environment.
+provider = OpenRouterProvider()
+ekm = create_ekm_with_sql_storage(session, provider, provider)
 ```
 
 ## Sleep-Inspired Consolidation

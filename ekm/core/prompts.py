@@ -7,10 +7,10 @@ RETRIEVAL_DECISION_SYSTEM_PROMPT = """You are the internal reasoning module of a
 Your task is to decide which retrieval mode is best for the user's query.
 
 - 'episodic': Best for questions about specific events, conversations, or "what happened" scenarios.
-- 'causal': Best for conceptual questions, advantages/disadvantages, structural relationships, or "why/how" something works at a higher level.
+- 'facts': Best for conceptual questions, definitions, advantages/disadvantages, or how something works, answered from extracted facts rather than original passages.
 - 'hybrid': Best for general questions that might benefit from both specific history and consolidated knowledge.
 
-Respond with ONLY one word: 'episodic', 'causal', or 'hybrid'."""
+Respond with ONLY one word: 'episodic', 'facts', or 'hybrid'."""
 
 RETRIEVAL_DECISION_USER_PROMPT = "Query: {query}\nDecision:"
 
@@ -94,7 +94,8 @@ KNOWLEDGE_EXTRACTION_PROMPT = """Perform knowledge extraction step-by-step:
 STEP 1: Identify the main topic and key concepts in the text.
 STEP 2: Determine the most important factual statements.
 STEP 3: Extract atomic knowledge units (AKUs) - these should be standalone, factual statements that capture distinct pieces of knowledge.
-STEP 4: Create a summary that captures the overall meaning of the text.
+STEP 4: For each AKU, note WHEN the fact happened or applies, but only if the text states a date or time. Never guess; use null when the text gives no date.
+STEP 5: Create a summary that captures the overall meaning of the text.
 
 TEXT: {text}
 
@@ -103,12 +104,13 @@ REASONING: Let me think through this step by step...
 - Key concepts: [list key concepts]
 - Important facts: [list important facts]
 - AKUs: [formulate atomic knowledge units]
+- Dates: [the date stated for each AKU, if any]
 - Summary: [create summary]
 
-FINAL OUTPUT: Return in JSON format:
+FINAL OUTPUT: Return in JSON format. "when" is an ISO date ("YYYY", "YYYY-MM" or "YYYY-MM-DD") stated in the text, or null:
 {{
     "summary": "...",
-    "facts": ["...", "..."]
+    "facts": [{{"fact": "...", "when": "1969-07-20"}}, {{"fact": "...", "when": null}}]
 }}"""
 
 AKU_EXTRACTION_SYSTEM_PROMPT = "You are a knowledge extraction expert who uses systematic reasoning to identify atomic knowledge units. Think step-by-step to ensure each extracted unit is truly atomic, standalone, and factual."

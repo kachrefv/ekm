@@ -10,6 +10,9 @@ from .scalability import ScalableEKMBackend
 from ..storage.base import BaseStorage
 from ..providers.base import BaseLLM, BaseEmbeddings
 from .utils import cosine_similarity
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class TrainingService:
@@ -62,49 +65,49 @@ class TrainingService:
                 workspace_id, chunk, summary, ep_embedding, {"title": title}
             )
 
-            # 6. Save AKUs
+            # 6. Save AKUs, with the date each fact is about when the text states one
+            fact_times = extraction_result.get('fact_times') or []
             akus_to_save = []
-            for content, emb in zip(aku_contents, aku_embeddings):
-                akus_to_save.append({"content": content, "embedding": emb})
+            for i, (content, emb) in enumerate(zip(aku_contents, aku_embeddings)):
+                aku = {"content": content, "embedding": emb}
+                event_time = fact_times[i] if i < len(fact_times) else None
+                if event_time:
+                    aku["metadata"] = {"event_time": event_time}
+                akus_to_save.append(aku)
 
             aku_ids = await self.storage.save_akus(workspace_id, episode_id, akus_to_save)
 
-            # 7. Add AKUs to scalable vector index
-            await self.scalable_backend.add_akus_batch(
-                workspace_id, 
-                [{"content": content, "id": id} for content, id in zip(aku_contents, aku_ids)]
-            )
+            # 7. Add the AKUs just saved to this workspace's vector index.
+            # (This used to call add_akus_batch, which embedded and saved every
+            # AKU a second time, without its episode, and indexed only the copies.)
+            await self.scalable_backend.index_akus(workspace_id, aku_ids, aku_embeddings)
 
-            # 8. Generate Relationships
-            # Simplified: connect all AKUs in the same episode
-            # 8. Generate Relationships using Global Vector Search
+            # 8. Generate relationships to earlier AKUs in the workspace.
+            # AKUs from this chunk are linked by the local loop below instead.
             relationships = []
-            
-            # Search for global connections for each new AKU
-            for i, (current_id, current_emb) in enumerate(zip(aku_ids, aku_embeddings)):
-                # Search locally and globally
+            this_chunk = {str(a) for a in aku_ids}
+
+            for current_id, current_emb in zip(aku_ids, aku_embeddings):
                 try:
-                    distances, neighbor_ids = self.scalable_backend.vector_index.search(
-                        np.array(current_emb), k=15 # Search slightly more to ensure good matches
+                    neighbors = await self.scalable_backend.search_similar_akus(
+                        workspace_id, current_emb, k=15 + len(this_chunk)
                     )
-                    
-                    for dist, neighbor_id in zip(distances, neighbor_ids):
-                        if neighbor_id is None or neighbor_id == current_id:
-                            continue
-                            
-                        # Convert distance to similarity consistent with ScalableEKMBackend
-                        sim = 1.0 / (1.0 + float(dist))
-                        
-                        if sim > 0.7:
-                            relationships.append({
-                                'source_aku_id': current_id,
-                                'target_aku_id': neighbor_id,
-                                'semantic_similarity': sim,
-                                'temporal_proximity': 0.0 # Will be updated by graph manager if time info avail
-                            })
                 except Exception as e:
-                    # Fallback to local loop if index search fails
-                    pass
+                    logger.warning(f"Neighbour search failed for AKU {current_id}; "
+                                   f"only same-chunk links will be created: {e}")
+                    continue
+
+                for neighbor_id, sim in neighbors:
+                    if neighbor_id in this_chunk:
+                        continue
+                    # Cosine, the same measure and threshold as the local loop
+                    if sim > 0.7:
+                        relationships.append({
+                            'source_aku_id': current_id,
+                            'target_aku_id': neighbor_id,
+                            'semantic_similarity': sim,
+                            'temporal_proximity': 0.0 # Will be updated by graph manager if time info avail
+                        })
             
             # Ensure local temporal connections (fallback/reinforcement)
             for i in range(len(aku_ids)):

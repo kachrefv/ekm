@@ -14,21 +14,22 @@ cp .env.example .env
 
 - `DATABASE_URL`: Connection string for the database (default: `sqlite:///./ekm.db`)
 
-### LLM Provider Configuration
+### LLM and Embedding Providers (OpenRouter)
 
-Choose one of the following providers:
+EKM uses [OpenRouter](https://openrouter.ai) for both the LLM and the embeddings, so one key covers both:
 
-- `LLM_PROVIDER`: Provider to use (`openai`, `anthropic`, `cohere`, `groq`, `ollama`)
-- `OPENAI_API_KEY`: OpenAI API key
-- `ANTHROPIC_API_KEY`: Anthropic API key
-- `COHERE_API_KEY`: Cohere API key
-- `GROQ_API_KEY`: Groq API key
-- `OLLAMA_BASE_URL`: Ollama server URL (default: `http://localhost:11434`)
+- `OPENROUTER_API_KEY`: OpenRouter API key (required)
+- `OPENROUTER_LLM_MODEL`: LLM model ID (default: `anthropic/claude-haiku-5.5`)
+- `OPENROUTER_EMBEDDING_MODEL`: Embedding model ID (default: `openai/text-embedding-3-small`, 1536 dimensions). The list is at `https://openrouter.ai/api/v1/embeddings/models`.
 
-### Embedding Provider Configuration
+Changing the embedding model changes the vector space. Facts embedded with one model can't be compared with queries embedded by another, so re-train existing workspaces after switching.
 
-- `EMBEDDING_PROVIDER`: Provider for embeddings (same options as LLM)
-- `EMBEDDING_MODEL`: Specific embedding model to use
+```python
+from ekm.providers.openrouter import OpenRouterProvider
+
+provider = OpenRouterProvider()  # reads the variables above
+ekm = EKM(storage, llm=provider, embeddings=provider)
+```
 
 ### Performance Settings
 

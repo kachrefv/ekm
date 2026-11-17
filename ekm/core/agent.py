@@ -37,7 +37,7 @@ class EKMAgent:
         
     async def think_about_retrieval(self, query: str) -> str:
         """
-        Decides the best retrieval mode ('episodic', 'causal', or 'hybrid') for the query.
+        Decides the best retrieval mode ('episodic', 'facts', or 'hybrid') for the query.
         """
         try:
             decision = await self.ekm.llm.generate(
@@ -47,7 +47,7 @@ class EKMAgent:
             
             decision = decision.strip().lower()
             if 'episodic' in decision: return 'episodic'
-            if 'causal' in decision: return 'causal'
+            if 'facts' in decision or 'causal' in decision: return 'facts'
             return 'hybrid'
         except Exception as e:
             logger.warning(f"Reasoning failed, defaulting to hybrid: {e}")
@@ -76,7 +76,8 @@ class EKMAgent:
         )
 
         # 3. Focus Buffer Update and Context Injection
-        retrieved_aku_ids = [res['id'] for res in retrieval_response.get('results', []) if res.get('id')]
+        retrieved_aku_ids = [res['id'] for res in retrieval_response.get('results', [])
+                                 if res.get('id') and res.get('item_type', 'aku') == 'aku']  # facts only, not episodes
         self.focus_buffer.update(retrieved_aku_ids)
 
         # Build Focused Attention context
@@ -114,7 +115,7 @@ class EKMAgent:
 
         for res in retrieval_response.get('results', []):
             has_results = True
-            source = res.get('source_gku') or res.get('metadata', {}).get('gku_name', 'Unknown')
+            source = res.get('source_gku') or res.get('metadata', {}).get('gku_name') or 'Unknown'
             content = res.get('content', '').replace('\n', ' ')
             created_at = res.get('created_at', 'Unknown')
 
@@ -288,7 +289,8 @@ class EKMAgent:
             )
             
             # Update focus buffer
-            retrieved_aku_ids = [res['id'] for res in retrieval_response.get('results', []) if res.get('id')]
+            retrieved_aku_ids = [res['id'] for res in retrieval_response.get('results', [])
+                                 if res.get('id') and res.get('item_type', 'aku') == 'aku']  # facts only, not episodes
             self.focus_buffer.update(retrieved_aku_ids)
             
             # Build context from retrieval results
@@ -297,7 +299,7 @@ class EKMAgent:
             
             for res in retrieval_response.get('results', []):
                 has_results = True
-                source = res.get('source_gku') or res.get('metadata', {}).get('gku_name', 'Unknown')
+                source = res.get('source_gku') or res.get('metadata', {}).get('gku_name') or 'Unknown'
                 content = res.get('content', '').replace('\n', ' ')
                 created_at = res.get('created_at', 'Unknown')
                 

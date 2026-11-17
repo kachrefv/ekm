@@ -62,6 +62,24 @@ class BaseStorage(ABC):
     async def get_akus_in_gku(self, gku_id: str) -> List[Dict[str, Any]]:
         pass
 
+    async def get_gku_ids_for_akus(self, workspace_id: str, aku_ids: List[str]) -> Dict[str, List[str]]:
+        """
+        {aku_id: [ids of the GKUs that contain it]} for the given AKUs (AKUs in
+        no GKU are left out). Used to boost GKUs holding focus-buffer facts.
+
+        This default walks every GKU of the workspace; backends should
+        override it with a single lookup.
+        """
+        wanted = {str(i) for i in aku_ids}
+        membership: Dict[str, List[str]] = {}
+        if not wanted:
+            return membership
+        for gku in await self.get_gkus_by_workspace(workspace_id):
+            for aku in await self.get_akus_in_gku(gku['id']):
+                if str(aku['id']) in wanted:
+                    membership.setdefault(str(aku['id']), []).append(gku['id'])
+        return membership
+
     @abstractmethod
     async def get_akus_with_embeddings(self, workspace_id: str) -> List[Dict[str, Any]]:
         pass

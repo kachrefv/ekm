@@ -8,7 +8,7 @@ from sqlalchemy.orm import sessionmaker
 
 from ekm.core.mesh import EKM
 from ekm.storage.sql import SQLStorage
-from ekm.providers.gemini import GeminiProvider
+from ekm.providers.openrouter import OpenRouterProvider
 from ekm.core.models import Base, Setting
 from .config import settings
 
@@ -46,9 +46,12 @@ async def get_ekm_instance(workspace_id: Optional[str] = None):
         db_session = SessionLocal()
         try:
             storage = SQLStorage(db=db_session)
-            # Use environment variable or fallback
-            api_key = settings.GEMINI_API_KEY
-            provider = GeminiProvider(api_key=api_key)
+            # Claude Haiku 5.5 (LLM) + OpenRouter embeddings, from settings/env
+            provider = OpenRouterProvider(
+                api_key=settings.OPENROUTER_API_KEY,
+                model_name=settings.OPENROUTER_LLM_MODEL,
+                embedding_model=settings.OPENROUTER_EMBEDDING_MODEL,
+            )
 
             _ekm_instance = EKM(
                 storage=storage,

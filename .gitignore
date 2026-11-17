@@ -32,3 +32,8 @@ htmlcov/
 .vscode/
 *.swp
 *.swo
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3

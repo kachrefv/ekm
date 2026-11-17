@@ -58,7 +58,7 @@ class DocumentLoader:
             "Format the output as clear, descriptive text that can be used for knowledge extraction."
         )
         
-        # We'll need to update GeminiProvider to handle this
+        # Needs a vision-capable provider (OpenRouterProvider with Claude Haiku 5.5 is)
         return await self.llm_provider.generate_from_image(image_data, prompt)
 
     async def load_bytes(self, content: bytes, filename: str) -> str:

@@ -336,6 +336,39 @@ def extract_pattern_signature(
     return signature
 
 
+_TRIANGLE_KEYS = ('triangle', 'triangles')
+_WEDGE_KEYS = ('wedge', 'wedges')
+
+
+def _as_float(stats: Any, *keys: str) -> Optional[float]:
+    """First numeric value found under any of `keys`, or None."""
+    if not isinstance(stats, dict):
+        return None
+    for key in keys:
+        value = stats.get(key)
+        if isinstance(value, (int, float, np.integer, np.floating)):
+            return float(value)
+    return None
+
+
+def _triangle_share(graphlets: Any) -> Optional[float]:
+    """Triangles / (triangles + open wedges): the graph's transitivity.
+    Independent of graph size; None when the graph has no connected 3-node subgraph."""
+    triangles = _as_float(graphlets, *_TRIANGLE_KEYS) or 0.0
+    wedges = _as_float(graphlets, *_WEDGE_KEYS) or 0.0
+    total = triangles + wedges
+    return triangles / total if total > 0 else None
+
+
+def _degree_variation(degree_stats: Any) -> Optional[float]:
+    """Std / mean of node degrees: how hub-like the graph is, independent of size."""
+    mean = _as_float(degree_stats, 'mean_degree', 'mean')
+    if not mean or mean <= 0:
+        return None
+    std = _as_float(degree_stats, 'std_degree', 'std') or 0.0
+    return std / mean
+
+
 def calculate_pattern_similarity(sig1: Dict[str, Any], sig2: Dict[str, Any], weights: Optional[Dict[str, float]] = None) -> float:
     """
     Calculate similarity between two pattern signatures using weighted combination of features.
@@ -346,87 +379,61 @@ def calculate_pattern_similarity(sig1: Dict[str, Any], sig2: Dict[str, Any], wei
             'graphlets': 0.3,
             'random_walks': 0.2,
             'degree_stats': 0.2,
-            'semantic_centroids': 0.3
+            'semantic_centroids': 0.3,
+            # Shape alone says little about topic; matching relation names is
+            # what makes structural matching informative, so it weighs most.
+            'relation_labels': 0.6
         }
 
     similarities = {}
     total_weight = 0.0
     weighted_sum = 0.0
 
-    # 1. Graphlet similarity (using Jaccard-like coefficient)
+    # Every structural feature below is size-independent: a query graph has a
+    # handful of nodes and a cluster graph many more, so raw counts would only
+    # measure size. A feature that is undefined for either side (e.g. a query
+    # graph with fewer than 3 connected nodes) is skipped rather than scored 0,
+    # so it does not drag down every cluster equally.
+
+    def _add(name: str, value: Optional[float]) -> None:
+        nonlocal weighted_sum, total_weight
+        if value is None:
+            return
+        similarities[name] = value
+        weight = weights.get(name, 0.0)
+        if weight > 0:
+            weighted_sum += weight * value
+            total_weight += weight
+
+    # 1. Graphlets: share of closed triangles among connected 3-node subgraphs
     if 'graphlets' in sig1 and 'graphlets' in sig2:
-        g1 = sig1['graphlets']
-        g2 = sig2['graphlets']
-        
-        # Use numpy for faster computation
-        keys = set(g1.keys()) & set(g2.keys())
-        if keys:
-            vals1 = np.array([g1[k] for k in keys])
-            vals2 = np.array([g2[k] for k in keys])
-            
-            intersection = np.sum(np.minimum(vals1, vals2))
-            union = np.sum(np.maximum(vals1, vals2))
-            
-            graphlet_sim = intersection / union if union > 0 else 0.0
-        else:
-            graphlet_sim = 0.0
-            
-        similarities['graphlets'] = graphlet_sim
-        weight = weights.get('graphlets', 0.0)
-        if weight > 0:
-            weighted_sum += weight * graphlet_sim
-            total_weight += weight
+        t1 = _triangle_share(sig1['graphlets'])
+        t2 = _triangle_share(sig2['graphlets'])
+        if t1 is not None and t2 is not None:
+            _add('graphlets', 1.0 - abs(t1 - t2))
 
-    # 2. Random walk similarity (comparing pattern counts and transition probabilities)
-    if 'random_walks' in sig1 and 'random_walks' in sig2 and weights.get('random_walks', 0) > 0:
-        rw1 = sig1['random_walks']
-        rw2 = sig2['random_walks']
+    # 2. Random walks: probability that a walk returns to its start
+    if 'random_walks' in sig1 and 'random_walks' in sig2:
+        r1 = _as_float(sig1['random_walks'], 'return_probability')
+        r2 = _as_float(sig2['random_walks'], 'return_probability')
+        if r1 is not None and r2 is not None:
+            _add('random_walks', max(0.0, 1.0 - abs(r1 - r2)))
 
-        # Compare number of unique patterns
-        count1 = rw1.get('num_unique_patterns', 0)
-        count2 = rw2.get('num_unique_patterns', 0)
-        max_count = max(count1, count2)
-        pattern_count_sim = (min(count1, count2) / max_count) if max_count > 0 else 1.0
+    # 4. Relation labels: do the two graphs talk about the same kinds of links?
+    # Overlap coefficient |A ∩ B| / min(|A|, |B|): a 2-relation query fully
+    # covered by a cluster with 40 relations scores 1, regardless of size.
+    if 'relation_labels' in sig1 and 'relation_labels' in sig2:
+        labels1 = set(sig1['relation_labels'] or [])
+        labels2 = set(sig2['relation_labels'] or [])
+        if labels1 and labels2:
+            _add('relation_labels', len(labels1 & labels2) / min(len(labels1), len(labels2)))
 
-        # Compare average transition probabilities
-        avg_prob1 = rw1.get('avg_transition_prob', 0.0)
-        avg_prob2 = rw2.get('avg_transition_prob', 0.0)
-        prob_diff = abs(avg_prob1 - avg_prob2)
-        transition_prob_sim = max(0.0, 1.0 - prob_diff)
-
-        # Combine both aspects
-        random_walk_sim = 0.5 * pattern_count_sim + 0.5 * transition_prob_sim
-        similarities['random_walks'] = random_walk_sim
-        
-        weight = weights.get('random_walks', 0.0)
-        if weight > 0:
-            weighted_sum += weight * random_walk_sim
-            total_weight += weight
-
-    # 3. Degree statistics similarity
-    if 'degree_stats' in sig1 and 'degree_stats' in sig2 and weights.get('degree_stats', 0) > 0:
-        ds1 = sig1['degree_stats']
-        ds2 = sig2['degree_stats']
-
-        # Compare mean degrees (normalized)
-        mean_deg1 = ds1.get('mean_degree', 0.0)
-        mean_deg2 = ds2.get('mean_degree', 0.0)
-        max_mean = max(mean_deg1, mean_deg2, 1.0)  # Avoid division by zero
-        mean_sim = 1.0 - abs(mean_deg1 - mean_deg2) / max_mean if max_mean > 0 else 1.0
-
-        # Compare std degrees
-        std_deg1 = ds1.get('std_degree', 0.0)
-        std_deg2 = ds2.get('std_degree', 0.0)
-        max_std = max(std_deg1, std_deg2, 1.0)
-        std_sim = 1.0 - abs(std_deg1 - std_deg2) / max_std if max_std > 0 else 1.0
-
-        degree_sim = 0.6 * mean_sim + 0.4 * std_sim
-        similarities['degree_stats'] = degree_sim
-        
-        weight = weights.get('degree_stats', 0.0)
-        if weight > 0:
-            weighted_sum += weight * degree_sim
-            total_weight += weight
+    # 3. Degrees: how uneven the degrees are (coefficient of variation)
+    if 'degree_stats' in sig1 and 'degree_stats' in sig2:
+        cv1 = _degree_variation(sig1['degree_stats'])
+        cv2 = _degree_variation(sig2['degree_stats'])
+        if cv1 is not None and cv2 is not None:
+            _add('degree_stats', 1.0 - abs(cv1 - cv2) / max(cv1, cv2, 1.0))
 
     # 4. Semantic centroid similarity (if available)
     if 'semantic_centroids' in sig1 and 'semantic_centroids' in sig2 and weights.get('semantic_centroids', 0) > 0:

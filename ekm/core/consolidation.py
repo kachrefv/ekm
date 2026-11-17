@@ -51,6 +51,9 @@ class SleepConsolidator:
         self.storage = storage
         self.llm = llm
         self.embeddings = embeddings
+        # Per-run bookkeeping for the metrics (reset by run_consolidation)
+        self._active_aku_count = 0
+        self._merge_groups: List[Tuple[str, List[str]]] = []
         self.replay_threshold = replay_threshold
         self.consolidate_threshold = consolidate_threshold
         self.min_cluster_support = min_cluster_support
@@ -66,6 +69,8 @@ class SleepConsolidator:
             ConsolidationResult with details of the consolidation
         """
         logger.info(f"Starting consolidation for workspace {workspace_id}")
+        self._active_aku_count = 0
+        self._merge_groups: List[Tuple[str, List[str]]] = []  # (merged AKU id, original AKU ids)
         
         # Phase 1: REPLAY - Build similarity graph of recent AKUs
         logger.info("Phase 1: REPLAY - Building similarity graph")
@@ -76,7 +81,11 @@ class SleepConsolidator:
         consolidated_akus, archived_akus = await self._consolidate_phase(
             workspace_id, similarity_graph
         )
-        
+
+        # Measured: how well each merged AKU's text still covers its originals.
+        # Done before PRUNE because SQL storage hides archived AKUs.
+        semantic_preservation = await self._measure_semantic_preservation(self._merge_groups)
+
         # Phase 3: REORGANIZE - Update pattern tensors and GKU memberships
         logger.info("Phase 3: REORGANIZE - Updating pattern tensors")
         created_gkus = await self._reorganize_phase(workspace_id)
@@ -86,12 +95,12 @@ class SleepConsolidator:
         await self._prune_phase(archived_akus)
         
         # Calculate metrics
-        original_count = len(consolidated_akus) + len(archived_akus)
-        new_count = len(consolidated_akus)
-        compression_ratio = (original_count - new_count) / original_count if original_count > 0 else 0.0
+        # Compression is measured against all active AKUs before this run, not
+        # only the ones that were merged (which made any merge look like ~70%).
+        original_count = self._active_aku_count
+        removed = len(archived_akus) - len(consolidated_akus)
+        compression_ratio = removed / original_count if original_count > 0 else 0.0
 
-        # Estimate semantic preservation based on consolidation process
-        semantic_preservation = self._calculate_semantic_preservation(original_count, len(created_gkus), compression_ratio)
         
         result = ConsolidationResult(
             consolidated_akus=consolidated_akus,
@@ -116,6 +125,7 @@ class SleepConsolidator:
         """
         # Get all non-archived AKUs in the workspace
         all_akus = await self.storage.get_akus_with_embeddings(workspace_id)
+        self._active_aku_count = len(all_akus)
 
         # Filter to only AKUs with embeddings
         akus_with_embeddings = [aku for aku in all_akus if aku['embedding'] is not None]
@@ -206,6 +216,7 @@ class SleepConsolidator:
             merged_aku_id = await self._merge_akus_in_cluster(workspace_id, cluster)
             if merged_aku_id:
                 new_aku_ids.append(merged_aku_id)
+                self._merge_groups.append((merged_aku_id, list(cluster)))
                 # Archive original AKUs in the cluster
                 archived_aku_ids.extend(cluster)
         
@@ -230,7 +241,8 @@ class SleepConsolidator:
         new_gku_ids = await form_gkus_from_akus(
             storage=self.storage,
             workspace_id=workspace_id,
-            min_cluster_size=self.min_cluster_support
+            min_cluster_size=self.min_cluster_support,
+            llm=self.llm  # build GKU structure from extracted relations
         )
         
         logger.info(f"Created {len(new_gku_ids)} new GKUs during reorganization")
@@ -400,7 +412,52 @@ class SleepConsolidator:
             # Fallback: concatenate contents
             return " ".join(contents)
     
+    async def _measure_semantic_preservation(self, merge_groups: List[Tuple[str, List[str]]]) -> float:
+        """
+        Mean cosine similarity between each archived original AKU and the text of
+        the AKU it was merged into, re-embedded. 1.0 when nothing was merged.
+
+        The merged AKU's stored embedding is an average of the originals, so it
+        would always look close; embedding its *text* checks whether the written
+        summary actually kept each original fact.
+        """
+        if not merge_groups:
+            return 1.0
+        all_ids = [mid for mid, _ in merge_groups] + [oid for _, group in merge_groups for oid in group]
+        try:
+            by_id = {a['id']: a for a in await self.storage.get_akus_by_ids(all_ids)}
+        except Exception as e:
+            logger.warning(f"Could not load AKUs to measure semantic preservation: {e}")
+            return float('nan')
+
+        scores = []
+        for merged_id, originals in merge_groups:
+            merged = by_id.get(merged_id)
+            if not merged or not merged.get('content'):
+                continue
+            merged_emb = await self.embeddings.embed_query(merged['content'])
+            for original_id in originals:
+                original = by_id.get(original_id)
+                if original and original.get('embedding') is not None:
+                    emb = original['embedding']
+                    if isinstance(emb, str):
+                        import json
+                        emb = json.loads(emb)
+                    scores.append(self._cosine_similarity(emb, merged_emb))
+
+        if not scores:
+            return float('nan')
+        logger.info(f"Semantic preservation: mean {np.mean(scores):.3f}, worst {np.min(scores):.3f} "
+                    f"over {len(scores)} merged AKUs")
+        return float(np.mean(scores))
+
     def _calculate_semantic_preservation(self, original_count: int, gku_count: int, compression_ratio: float) -> float:
+        """Deprecated: a formula over counts that never looked at content.
+        Kept for backward compatibility; run_consolidation uses
+        _measure_semantic_preservation instead."""
+        return self._legacy_preservation_estimate(original_count, gku_count, compression_ratio)
+
+    def _legacy_preservation_estimate(self, original_count: int, gku_count: int, compression_ratio: float) -> float:
         """
         Calculate an estimate of semantic preservation based on consolidation outcomes.
         

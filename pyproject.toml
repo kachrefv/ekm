@@ -37,11 +37,11 @@ dependencies = [
     "aiosqlite>=0.17.0",    # Async SQLite driver
     "pgvector>=0.2.0",      # PostgreSQL vector extension
     
-    # LLM Providers
+    # LLM Providers (the default, OpenRouter, uses the openai client)
     "openai>=1.0.0",
     "anthropic>=0.5.0",
     "cohere>=4.0.0",
-    "google-generativeai>=0.3.0",
+    "google-genai>=1.0.0",  # ekm/providers/gemini.py imports google.genai
     "groq>=0.3.0",
     
     # Embeddings and Vector Operations

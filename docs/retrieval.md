@@ -20,103 +20,41 @@ The EKM retrieval system supports three distinct retrieval modes:
 - Retrieves personal experiences and temporal sequences
 - Ideal for context-dependent queries
 
-#### 3. Causal Mode
-- Emphasizes AKU and GKU layers with advanced attention
-- Optimized for high-performance semantic and structural matching
-- Best for conceptual and relational queries
+#### 3. Facts Mode (`mode='facts'`)
+- Retrieves only atomic facts (AKUs): those in the best-matching GKUs plus a direct search over all facts
+- Skips the episodic layer (raw source chunks)
+- Best for conceptual questions answered from extracted facts
+- Formerly called "causal" mode. `mode='causal'` still works but is deprecated: it never followed cause-and-effect links (relationships have a `causal_weight` field, but nothing sets it yet)
 
-### Hierarchical Retrieval Strategy
+### How a query is answered
 
-The system implements a two-stage hierarchical approach:
+1. **Embed the query once.** The same embedding is reused by every layer and by the RL reranker.
+2. **Start the query-graph extraction** (an LLM call feeding the structural head) in the background, so it overlaps with the steps below. It is skipped when the structural head weight is 0.
+3. **Episodic layer:** episodes of the workspace with cosine similarity of at least 0.3 (`EPISODIC_MIN_SIMILARITY`).
+4. **Facts layer, stage 1 (GKU selection):** every GKU is scored with the three heads below, combined as a weighted average (default 0.6 semantic / 0.25 structural / 0.15 temporal). GKUs that contain facts from the focus buffer get a bounded boost (at most +0.15). The best `top_k` GKUs are kept (at least 5 with `use_hierarchical_attention`).
+5. **Facts layer, stage 2:** all active facts of those GKUs are ranked by cosine similarity, and a direct similarity search over all facts of the workspace adds facts whose GKU was not selected (or that have no GKU yet, before the first consolidation).
+6. **One score scale.** Every result's `score` is its cosine similarity to the query. A fact inside a selected GKU gets a bonus of up to `GKU_CONTEXT_BOOST` (0.1), in proportion to the GKU's score. The bonus only adds, so being in a cluster never lowers a fact. Episodes and facts are therefore comparable when merged.
+7. **Optional RL reranking** (keeps this order until the RL model has learned from feedback).
+8. **Diversity:** at most 2 results from the same source episode (the chunk itself plus facts extracted from it) before other sources get a turn; deferred items still fill the list if nothing else is left.
 
-#### Stage 1: GKU Selection
-- Identifies relevant Global Knowledge Units using attention mechanisms
-- Reduces search space by focusing on conceptually related clusters
-- Uses semantic, structural, and temporal attention heads
+Similarity is cosine on every storage backend (pgvector, SQLite and in-memory), and episode search on SQLite is scoped per workspace.
 
-#### Stage 2: AKU Selection
-- Performs detailed retrieval within selected GKUs
-- Finds specific Atomic Knowledge Units relevant to the query
-- Balances specificity with contextual relevance
+### Attention heads
 
-## Core Components
+All three heads return raw scores (no softmax: a softmax over values in [-1, 1] is nearly uniform and erased the differences between GKUs).
 
-### 1. Attention-Based Retrieval Engine
+#### Semantic head
+Cosine similarity between the query embedding and each GKU's centroid.
 
-The core of the retrieval system uses QKV attention mechanisms with specialized heads:
+#### Structural head
+Similarity between the query's entity-relation pattern (extracted by the LLM) and each GKU's pattern signature, via `calculate_pattern_similarity`.
 
-#### Semantic Attention Head
-```python
-def semantic_attention(query_embedding, gku_embeddings):
-    # Compute cosine similarity between query and GKU embeddings
-    similarities = cosine_similarity(query_embedding, gku_embeddings)
-    # Apply softmax for attention weights
-    attention_weights = softmax(similarities)
-    return attention_weights
-```
+#### Temporal head
+`exp(-|now - t| / 30 days)`, where `t` is the median time of the GKU's facts (or its creation time). Since queries are always "now", this is a recency preference.
 
-- Matches query embeddings with GKU content embeddings
-- Uses cosine similarity for semantic relevance
-- Normalized attention weights for fair comparison
+### What is not used during retrieval
 
-#### Structural Attention Head
-```python
-def structural_attention(query_pattern, gku_patterns):
-    # Compute similarity between structural patterns
-    pattern_similarities = calculate_pattern_similarity(query_pattern, gku_patterns)
-    # Apply softmax for attention weights
-    attention_weights = softmax(pattern_similarities)
-    return attention_weights
-```
-
-- Matches query patterns with GKU structural signatures
-- Incorporates graph-based features (graphlets, degree statistics)
-- Uses weighted combination of multiple structural features
-
-#### Temporal Attention Head
-```python
-def temporal_attention(query_time_context, gku_times):
-    # Calculate temporal relevance using exponential decay
-    time_deltas = calculate_time_differences(query_time_context, gku_times)
-    tau = 86400 * 30  # 30 days in seconds
-    relevance_scores = exp(-time_deltas / tau)
-    attention_weights = softmax(relevance_scores)
-    return attention_weights
-```
-
-- Considers time-based relevance of knowledge units
-- Uses exponential decay based on time differences
-- Default decay constant of 30 days
-
-### 2. Sparse Attention Implementation
-
-To address computational complexity, EKM implements sparse attention:
-
-```python
-class SparseAttention:
-    def __init__(self, d_model, num_heads, sparsity_factor=0.1):
-        self.d_model = d_model
-        self.num_heads = num_heads
-        self.sparsity_factor = sparsity_factor
-        self.graph_manager = SparseGraphManager()
-    
-    def forward(self, Q, K, V, graph_structure=None):
-        # Only compute attention for connections in graph_structure
-        # Avoids materializing full N×N attention matrix
-        if graph_structure is not None:
-            # Compute attention only for active connections
-            sparse_scores = self.compute_sparse_attention(Q, K, graph_structure)
-            sparse_attn = self.sparse_softmax(sparse_scores)
-            output = self.sparse_aggregate(sparse_attn, V)
-        else:
-            # Fallback to dense attention
-            output = self.dense_attention(Q, K, V)
-        return output
-```
-
-- Reduces complexity from O(N²) to O(N*k) where k is average connections per node
-- Uses PyTorch sparse or SciPy sparse for efficiency
-- Automatic backend selection based on availability
+`SparseAttention`, `MultiHeadAttention` and the hierarchical coarse/fine attention helpers exist in `ekm/core/attention/mechanisms.py`, but retrieval does not call them, and `use_sparse_attention` is accepted only for API compatibility. Despite its name, `QKVAttentionRetriever` has no learned Q/K/V projections: each head is a similarity function.
 
 ### 3. Reinforcement Learning Integration
 
@@ -229,16 +167,21 @@ def compute_focus_boosts(focus_buffer, gku_ids):
 
 ### Retrieval Parameters
 - `top_k`: Number of results to return
-- `use_sparse_attention`: Enable sparse attention for efficiency
-- `use_adaptive_weights`: Use adaptive head weighting
-- `use_hierarchical_attention`: Use hierarchical attention approach
+- `mode`: `'hybrid'` (default), `'facts'` or `'episodic'`
+- `focus_buffer`: Facts the conversation is already about; their GKUs get a bounded boost
+- `use_adaptive_weights`: Read head weights from the service's shared weighting (changed only through `RetrievalService.record_head_feedback`)
+- `use_hierarchical_attention`: Select at least 5 GKUs instead of exactly `top_k`
 - `use_rl_feedback`: Enable RL-based reranking
+- `debug_mode`: Add per-head debug info (`debug_info`) and a ranking explanation (`metadata['explanation']`)
+- `use_sparse_attention`: Ignored; kept for API compatibility
 
-### Performance Tuning
-- `sparsity_factor`: Fraction of connections to keep in sparse attention
-- `coarse_top_k`: Number of clusters to select in coarse stage
-- `fine_top_k`: Number of items to select in fine stage
-- `semantic_threshold`: Minimum similarity threshold
+### Tuning constants (`ekm/core/retrieval/service.py`)
+- `GKU_CONTEXT_BOOST` (0.1): Largest bonus a GKU can add to a fact's score
+- `EPISODIC_MIN_SIMILARITY` (0.3): Cosine cut-off for episodes
+- `MAX_RESULTS_PER_SOURCE` (2): Results per source episode before others get a turn
+- `DEFAULT_HEAD_WEIGHTS` (`ekm/core/attention/mechanisms.py`): Weights of the semantic, structural and temporal heads
+
+Measure changes with `benchmarks/retrieval_quality.py`, which reports recall@k and MRR per configuration (for example with and without the structural head) on labelled queries.
 
 ## Quality Assurance
 

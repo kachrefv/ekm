@@ -204,58 +204,23 @@ def extract_enhanced_pattern_signature(embeddings: np.ndarray, labels: np.ndarra
     # Basic statistics
     n_points = len(cluster_embeddings)
     
-    # Degree statistics (based on similarity graph)
-    if n_points > 1:
-        similarity_matrix = cosine_similarity(cluster_embeddings)
-        # Set diagonal to 0 to exclude self-loops
-        np.fill_diagonal(similarity_matrix, 0)
-        # Threshold to create adjacency matrix
-        threshold = 0.5
-        adj_matrix = (similarity_matrix > threshold).astype(int)
-        
-        # Calculate degrees
-        degrees = np.sum(adj_matrix, axis=1)
-        degree_stats = {
-            'mean_degree': float(np.mean(degrees)),
-            'std_degree': float(np.std(degrees)),
-            'max_degree': int(np.max(degrees)),
-            'min_degree': int(np.min(degrees)),
-            'degree_distribution': dict(zip(*np.unique(degrees, return_counts=True)))
-        }
-        
-        # Graphlet counts (simplified - counting triangles and edges)
-        n_triangles = 0
-        for i in range(n_points):
-            for j in range(i+1, n_points):
-                for k in range(j+1, n_points):
-                    if adj_matrix[i,j] and adj_matrix[j,k] and adj_matrix[k,i]:
-                        n_triangles += 1
-        
-        graphlets = {
-            'triangles': n_triangles,
-            'edges': int(np.sum(adj_matrix)) // 2,  # Divide by 2 since undirected
-            'nodes': n_points
-        }
-    else:
-        degree_stats = {
-            'mean_degree': 0.0,
-            'std_degree': 0.0,
-            'max_degree': 0,
-            'min_degree': 0,
-            'degree_distribution': {}
-        }
-        graphlets = {
-            'triangles': 0,
-            'edges': 0,
-            'nodes': 1
-        }
-    
-    # Random walk statistics (simplified)
-    random_walk_stats = {
-        'num_unique_patterns': n_points,
-        'avg_transition_prob': 0.5 if n_points > 1 else 1.0,  # Simplified
-        'stationary_distribution_entropy': min(np.log(n_points), 1.0) if n_points > 0 else 0.0
-    }
+    # Structural features of the cluster's similarity graph. These use the same
+    # functions (and therefore the same keys and definitions) as the query side
+    # in query_analysis.py, so calculate_pattern_similarity compares like with like.
+    from scipy.sparse import csr_matrix
+    from ..patterns import count_graphlets, compute_random_walk_patterns, compute_degree_statistics
+
+    similarity_matrix = cosine_similarity(cluster_embeddings)
+    # Set diagonal to 0 to exclude self-loops
+    np.fill_diagonal(similarity_matrix, 0)
+    # Threshold to create adjacency matrix
+    threshold = 0.5
+    # Sparse, like the query graph, so both sides take the same code paths
+    adj_matrix = csr_matrix((similarity_matrix > threshold).astype(np.float32))
+
+    graphlets = count_graphlets(adj_matrix)
+    degree_stats = compute_degree_statistics(adj_matrix)
+    random_walk_stats = compute_random_walk_patterns(adj_matrix)
     
     # Embedding statistics
     embedding_stats = {
@@ -436,7 +401,85 @@ def apply_spectral_clustering(embeddings: np.ndarray, n_clusters: Optional[int] 
         return np.zeros(len(embeddings), dtype=int)
 
 
-async def form_gkus_from_akus(storage: BaseStorage, workspace_id: str, min_cluster_size: int = 2) -> List[str]:
+def _to_epoch(value: Any) -> Optional[float]:
+    """Seconds since the epoch from a datetime, ISO-8601 string or number; None if unusable."""
+    if value is None or isinstance(value, bool):
+        return None
+    if hasattr(value, 'timestamp'):
+        try:
+            return float(value.timestamp())
+        except (OverflowError, OSError, ValueError):
+            return None
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return float(value)
+    if isinstance(value, str):
+        from datetime import datetime
+        try:
+            return datetime.fromisoformat(value.replace('Z', '+00:00')).timestamp()
+        except ValueError:
+            return None
+    return None
+
+
+def fact_time_summary(akus: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    When the knowledge in a cluster dates from, as epoch seconds.
+
+    Uses each AKU's `aku_metadata['event_time']` when present (the time the fact
+    is about), otherwise its `created_at` (when it was ingested). A GKU's own
+    `created_at` is not used: every GKU is recreated at each consolidation, so it
+    only says when consolidation last ran.
+    """
+    times, sources = [], set()
+    for aku in akus:
+        event_time = _to_epoch((aku.get('aku_metadata') or {}).get('event_time'))
+        if event_time is not None:
+            times.append(event_time)
+            sources.add('event_time')
+            continue
+        ingested = _to_epoch(aku.get('created_at'))
+        if ingested is not None:
+            times.append(ingested)
+            sources.add('ingested_at')
+    if not times:
+        return None
+    return {
+        'median': float(np.median(times)),
+        'oldest': float(np.min(times)),
+        'newest': float(np.max(times)),
+        'source': '+'.join(sorted(sources))
+    }
+
+
+def gku_reference_time(gku: Dict[str, Any]) -> Any:
+    """Time the temporal head should use for a GKU: its facts' median time, else its creation time."""
+    fact_time = (gku.get('cluster_metadata') or {}).get('fact_time')
+    if isinstance(fact_time, dict) and fact_time.get('median') is not None:
+        return fact_time['median']
+    return gku.get('created_at')
+
+
+def _facts_text(contents: List[str], max_chars: int) -> str:
+    """Bullet list of a cluster's facts, cut at max_chars to bound LLM cost."""
+    lines, used = [], 0
+    for content in contents:
+        if not content:
+            continue
+        line = f"- {content.strip()}"
+        if used + len(line) > max_chars and lines:
+            break
+        lines.append(line)
+        used += len(line) + 1
+    return "\n".join(lines)
+
+
+async def form_gkus_from_akus(
+    storage: BaseStorage,
+    workspace_id: str,
+    min_cluster_size: int = 2,
+    llm: Optional[Any] = None,
+    max_fact_chars: int = 6000
+) -> List[str]:
     """
     Form Global Knowledge Units (GKUs) from AKUs using enhanced clustering algorithms.
 
@@ -444,6 +487,12 @@ async def form_gkus_from_akus(storage: BaseStorage, workspace_id: str, min_clust
         storage: Storage interface to access AKUs
         workspace_id: ID of the workspace to process
         min_cluster_size: Minimum number of AKUs required to form a cluster/GKU
+        llm: If given, each GKU's structural signature is built from the
+            entity-relation graph the LLM extracts from the GKU's facts, the same
+            way query graphs are built. This costs one LLM call per GKU. Without
+            it (or if extraction fails) the signature falls back to the graph of
+            embedding similarities, which mostly repeats the semantic head.
+        max_fact_chars: Maximum characters of fact text sent per GKU
 
     Returns:
         List of created GKU IDs
@@ -459,10 +508,19 @@ async def form_gkus_from_akus(storage: BaseStorage, workspace_id: str, min_clust
         # Extract embeddings and corresponding AKU IDs
         embeddings = []
         aku_ids = []
+        aku_contents = {}
+        akus_by_id = {}
         for aku in all_akus:
             if aku.get('embedding') is not None:
                 embeddings.append(aku['embedding'])
                 aku_ids.append(aku['id'])
+                aku_contents[aku['id']] = aku.get('content') or ""
+                akus_by_id[aku['id']] = aku
+
+        extractor = None
+        if llm is not None:
+            from ..query_analysis import QueryGraphExtractor
+            extractor = QueryGraphExtractor(llm)
 
         if len(embeddings) < min_cluster_size:
             logger.info(f"Not enough AKUs with embeddings to form clusters: {len(embeddings)} < {min_cluster_size}")
@@ -508,6 +566,20 @@ async def form_gkus_from_akus(storage: BaseStorage, workspace_id: str, min_clust
 
                 # Create enhanced pattern signature for the cluster
                 pattern_signature = extract_enhanced_pattern_signature(embedding_array, cluster_labels, cluster_label)
+                pattern_signature['structure_source'] = 'embedding_similarity'
+
+                # Prefer the entity-relation graph of the cluster's facts: it is
+                # the same kind of graph as the query graph, and its shape is not
+                # derived from the embeddings the semantic head already uses.
+                if extractor is not None:
+                    facts = _facts_text([aku_contents.get(a, "") for a in aku_ids_in_cluster], max_fact_chars)
+                    relational = await extractor.extract_text_pattern(facts, label="FACTS") if facts else None
+                    if relational is not None:
+                        pattern_signature.update(relational)
+                        pattern_signature['structure_source'] = 'entity_relations'
+                    else:
+                        logger.warning(f"Relation extraction failed for cluster {cluster_label}; "
+                                       f"using the embedding-similarity graph instead")
 
                 # Add uncertainty information
                 pattern_signature['uncertainty'] = float(cluster_uncertainty)
@@ -525,7 +597,9 @@ async def form_gkus_from_akus(storage: BaseStorage, workspace_id: str, min_clust
                         'cluster_size': len(aku_ids_in_cluster),
                         'created_from_aku_count': len(aku_ids_in_cluster),
                         'uncertainty': float(cluster_uncertainty),
-                        'quality_metrics': quality_metrics
+                        'quality_metrics': quality_metrics,
+                        # Used by the temporal head instead of the GKU's creation time
+                        'fact_time': fact_time_summary([akus_by_id[a] for a in aku_ids_in_cluster])
                     }
                 )
 

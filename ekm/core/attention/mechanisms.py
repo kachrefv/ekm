@@ -2,6 +2,9 @@
 QKV Attention Implementation for EKM - Implements multi-head attention mechanism
 with semantic, structural, and temporal retrieval heads.
 """
+# Keep annotations unevaluated so `torch.Tensor` hints don't fail at import
+# time when torch is not installed (torch is optional; SciPy is the fallback).
+from __future__ import annotations
 
 import numpy as np
 import math
@@ -401,12 +404,7 @@ class SparseAttention:
         graph_structure: Optional[np.ndarray] = None,
         mask: Optional[np.ndarray] = None
     ) -> Tuple[np.ndarray, np.ndarray]:
-        # ... (original implementation kept for fallback correctness) ...
-        # (Original body omitted here for brevity, conceptually it's the same as before)
-        # For the tool call, I will include the existing method body to ensure it's not lost if I replace the class?
-        # The prompt says replace the CLASS. So I must provide the full class content.
-        # I'll paste the original method body below.
-
+        """Dense scaled dot-product attention with an optional graph mask (fallback path)."""
         # Handle the case where Q, K, V have been split into heads
         if len(Q.shape) == 4:  # (batch_size, num_heads, seq_len, depth)
             batch_size, num_heads, seq_len, d_model = Q.shape
@@ -629,12 +627,11 @@ class SemanticRetrievalHead:
         
         # Compute cosine similarities
         similarities = dot_products / (query_norm * gku_norms)
-        
-        # Apply softmax to convert to attention weights
-        exp_similarities = np.exp(similarities - np.max(similarities))  # Numerical stability
-        attention_weights = exp_similarities / np.sum(exp_similarities)
-        
-        return attention_weights
+
+        # Return raw cosine similarities. A softmax over values in [-1, 1] is
+        # nearly uniform (the best of 100 GKUs gets ~1% weight), which erased
+        # the differences between GKUs before the heads were combined.
+        return similarities
 
 
 class StructuralRetrievalHead:
@@ -666,21 +663,41 @@ class StructuralRetrievalHead:
             similarity = self._compute_pattern_similarity(query_pattern, gku_pattern)
             similarities.append(similarity)
         
-        similarities = np.array(similarities)
-        
-        # Apply softmax to convert to attention weights
-        exp_similarities = np.exp(similarities - np.max(similarities))  # Numerical stability
-        attention_weights = exp_similarities / np.sum(exp_similarities)
-        
-        return attention_weights
+        # Raw similarities in [0, 1]; see SemanticRetrievalHead for why no softmax
+        return np.array(similarities, dtype=float)
     
     def _compute_pattern_similarity(self, pattern1: Dict[str, Any], pattern2: Dict[str, Any]) -> float:
         """
         Compute similarity between two pattern signatures using weighted combination.
         Aligned with ekm.core.patterns.calculate_pattern_similarity.
         """
-        from ..core.patterns import calculate_pattern_similarity
+        from ..patterns import calculate_pattern_similarity
         return calculate_pattern_similarity(pattern1, pattern2)
+
+
+# Semantic similarity is the only validated signal, so it dominates; the
+# structural and temporal heads adjust the ranking rather than drive it.
+# These are a starting guess: tune them with a benchmark, or let
+# RetrievalService.record_head_feedback move them.
+DEFAULT_HEAD_WEIGHTS = {'semantic': 0.6, 'structural': 0.25, 'temporal': 0.15}
+
+
+def _compatible_heads(dim: int, requested: int) -> int:
+    """Largest head count <= requested that divides dim (at least 1)."""
+    for heads in range(max(1, min(requested, dim)), 0, -1):
+        if dim % heads == 0:
+            return heads
+    return 1
+
+
+def _gku_reference_time(gku: Dict[str, Any]) -> Any:
+    """The median time of a GKU's facts when recorded, else its creation time.
+
+    GKUs are recreated at every consolidation, so their own created_at only
+    says when consolidation last ran, not how recent their knowledge is.
+    """
+    from ..knowledge.organization import gku_reference_time
+    return gku_reference_time(gku)
 
 
 class TemporalRetrievalHead:
@@ -744,16 +761,15 @@ class TemporalRetrievalHead:
         tau = 86400 * 30  # Decay constant (30 days in seconds)
         
         # Handle infinite values
-        finite_deltas = np.where(time_deltas == float('inf'), np.max(time_deltas[np.isfinite(time_deltas)]) * 2, time_deltas)
-        
-        # Calculate relevance scores
-        relevance_scores = np.exp(-finite_deltas / tau)
-        
-        # Normalize to get attention weights
-        exp_relevance = np.exp(relevance_scores - np.max(relevance_scores))  # Numerical stability
-        attention_weights = exp_relevance / np.sum(exp_relevance)
-        
-        return attention_weights
+        finite = np.isfinite(time_deltas)
+        if not np.any(finite):
+            # No GKU has a timestamp: time gives no information
+            return np.ones(len(gku_times)) / len(gku_times)
+        finite_deltas = np.where(finite, time_deltas, np.max(time_deltas[finite]) * 2)
+
+        # Raw relevance in [0, 1]. The old softmax over these values was a
+        # second flattening on top of the decay, leaving almost no difference.
+        return np.exp(-finite_deltas / tau)
 
 
 class AdaptiveHeadWeighting:
@@ -771,9 +787,7 @@ class AdaptiveHeadWeighting:
         """
         if initial_weights is None:
             initial_weights = {
-                'semantic': 0.4,
-                'structural': 0.4,
-                'temporal': 0.2
+                **DEFAULT_HEAD_WEIGHTS
             }
         
         self.head_weights = initial_weights.copy()
@@ -840,16 +854,13 @@ class AdaptiveHeadWeighting:
                 for head, score in avg_performance.items()
             }
             
-            # Apply momentum from previous adjustments
-            if self.weight_adjustment_history:
-                prev_weights = self.weight_adjustment_history[-1]
-                for head in self.head_weights:
-                    self.head_weights[head] = (
-                        self.momentum * prev_weights[head] + 
-                        (1 - self.momentum) * normalized_performance[head]
-                    )
-            else:
-                self.head_weights = normalized_performance
+            # Move gradually from the current weights (momentum). The first
+            # update used to replace the configured weights outright.
+            for head in self.head_weights:
+                self.head_weights[head] = (
+                    self.momentum * self.head_weights[head] +
+                    (1 - self.momentum) * normalized_performance.get(head, 0.0)
+                )
         
         # Ensure weights sum to 1
         total_weight = sum(self.head_weights.values())
@@ -898,6 +909,150 @@ class AdaptiveHeadWeighting:
         return self.head_weights.copy()
 
 
+# Focus buffer: a GKU holding facts the conversation is already about gets a
+# bounded nudge. Focus weights grow without limit (1.5, 1.7, ...), so the old
+# "+ 0.5 * sum of weights" could outweigh every head combined.
+FOCUS_BOOST_MAX = 0.15
+
+
+async def _focus_boosts(storage: BaseStorage, workspace_id: str, gku_ids: List[str],
+                        focus_buffer: Optional[Any]) -> np.ndarray:
+    """Per-GKU boost in [0, FOCUS_BOOST_MAX] from the focus-buffer facts it contains."""
+    boosts = np.zeros(len(gku_ids))
+    items = getattr(focus_buffer, 'items', None) if focus_buffer is not None else None
+    if not items or not gku_ids:
+        return boosts
+    weights = {str(aku_id): float(getattr(item, 'current_weight', 1.0)) for aku_id, item in items.items()}
+    try:
+        membership = await storage.get_gku_ids_for_akus(workspace_id, list(weights))
+    except Exception as e:
+        logger.warning(f"Focus buffer lookup failed, ignoring focus: {e}")
+        return boosts
+    position = {gku_id: i for i, gku_id in enumerate(gku_ids)}
+    for aku_id, parents in membership.items():
+        for gku_id in parents:
+            if gku_id in position:
+                boosts[position[gku_id]] += weights.get(str(aku_id), 0.0)
+    return FOCUS_BOOST_MAX * np.tanh(boosts)
+
+
+async def _two_stage_retrieve(
+    storage: BaseStorage,
+    workspace_id: str,
+    query_embedding: List[float],
+    query_pattern: Optional[Dict[str, Any]],
+    query_time_context: Optional[Dict[str, Any]],
+    head_weights: Dict[str, float],
+    num_gkus: int,
+    top_k: int,
+    focus_buffer: Optional[Any],
+    mode: str
+) -> AttentionResult:
+    """
+    Stage 1 scores every GKU with the semantic, structural and temporal heads
+    (plus the focus boost) and keeps the best `num_gkus`. Stage 2 ranks all
+    facts in those GKUs by cosine similarity to the query.
+
+    The interpretations carry everything RetrievalService needs, so it does
+    not fetch the GKUs or their facts again:
+        selected_gku_ids, gku_scores, gku_info, ranked_akus (each fact with
+        'parent_gku_id' and 'aku_similarity'), top_aku_ids, and the per-head
+        contributions of the selected GKUs.
+    """
+    gkus = await storage.get_gkus_by_workspace(workspace_id)
+    query_emb_array = np.asarray(query_embedding, dtype=float)
+
+    gku_embeddings, gku_patterns, gku_times, gku_ids, gku_info = [], [], [], [], []
+    for gku in gkus:
+        emb = gku.get('centroid_embedding')
+        if isinstance(emb, str):
+            import json
+            emb = json.loads(emb)
+        if emb is None or len(emb) == 0 or len(emb) != len(query_emb_array):
+            continue
+        gku_embeddings.append(np.asarray(emb, dtype=float))
+        gku_patterns.append(gku.get('pattern_signature') or {})
+        gku_times.append({'created_at': _gku_reference_time(gku)})
+        gku_ids.append(gku['id'])
+        gku_info.append({'id': gku['id'], 'name': gku.get('name'), 'description': gku.get('description')})
+
+    base_interpretations = {
+        'head_weights_used': dict(head_weights),
+        'retrieval_mode': mode,
+    }
+    if not gku_ids:
+        # Not consolidated yet. RetrievalService searches facts directly, so
+        # there is nothing to add here.
+        return AttentionResult(
+            scores=np.array([]),
+            weights={'semantic': np.array([]), 'structural': np.array([]), 'temporal': np.array([])},
+            interpretations={**base_interpretations, 'selected_gku_ids': [], 'gku_scores': {},
+                             'gku_info': {}, 'ranked_akus': [], 'top_aku_ids': [],
+                             'reason': 'no_gkus'}
+        )
+
+    semantic = SemanticRetrievalHead().compute_attention(query_emb_array, gku_embeddings)
+    structural = StructuralRetrievalHead().compute_attention(query_pattern or {}, gku_patterns)
+    temporal = TemporalRetrievalHead().compute_attention(query_time_context, gku_times)
+    # Heads return raw scores on comparable scales (cosine in [-1, 1],
+    # structural and temporal in [0, 1]), combined as a weighted average.
+    combined = (
+        head_weights.get('semantic', 0.0) * semantic +
+        head_weights.get('structural', 0.0) * structural +
+        head_weights.get('temporal', 0.0) * temporal
+    )
+    stage1 = combined + await _focus_boosts(storage, workspace_id, gku_ids, focus_buffer)
+
+    top = [int(i) for i in np.argsort(stage1)[::-1][:max(1, num_gkus)]]
+    selected = [gku_ids[i] for i in top]
+
+    # Stage 2: every fact of the selected GKUs, ranked by similarity to the query.
+    ranked, seen = [], set()
+    for i in top:
+        for aku in await storage.get_akus_in_gku(gku_ids[i]):
+            if aku['id'] in seen:
+                continue  # in two selected GKUs: keep the better-ranked parent
+            seen.add(aku['id'])
+            entry = dict(aku)
+            entry['parent_gku_id'] = gku_ids[i]
+            entry['aku_similarity'] = _cosine(query_emb_array, entry.get('embedding'))
+            ranked.append(entry)
+    ranked.sort(key=lambda a: a['aku_similarity'], reverse=True)
+
+    interpretations = {
+        **base_interpretations,
+        'selected_gku_ids': selected,
+        'top_gku_ids': selected,
+        'gku_scores': {gku_ids[i]: float(stage1[i]) for i in top},
+        'gku_info': {gku_ids[i]: gku_info[i] for i in top},
+        'ranked_akus': ranked,
+        'top_aku_ids': [a['id'] for a in ranked[:top_k]],
+        'hierarchical_2stage': True,
+        'semantic_contributions': semantic[top],
+        'structural_contributions': structural[top],
+        'temporal_contributions': temporal[top],
+    }
+    return AttentionResult(
+        scores=np.array([a['aku_similarity'] for a in ranked[:top_k]]),
+        weights={'semantic': semantic, 'structural': structural, 'temporal': temporal},
+        interpretations=interpretations
+    )
+
+
+def _cosine(query: np.ndarray, embedding: Any) -> float:
+    """Cosine similarity; 0.0 for a missing, empty or mismatched embedding."""
+    if embedding is None:
+        return 0.0
+    if isinstance(embedding, str):
+        import json
+        embedding = json.loads(embedding)
+    vec = np.asarray(embedding, dtype=float).reshape(-1)
+    if vec.shape != query.shape:
+        return 0.0
+    denom = float(np.linalg.norm(vec) * np.linalg.norm(query))
+    return float(vec @ query / denom) if denom > 0 else 0.0
+
+
 class HierarchicalAttention:
     """
     Implements hierarchical attention mechanism with two stages:
@@ -923,24 +1078,10 @@ class HierarchicalAttention:
         self.coarse_top_k = coarse_top_k
         self.fine_top_k = fine_top_k
         
-        # Coarse-grained attention for cluster selection
-        self.coarse_attention = SparseAttention(
-            d_model=d_model, 
-            num_heads=num_coarse_heads, 
-            sparsity_factor=0.3  # Higher sparsity for coarse attention
-        )
-        
-        # Fine-grained attention for detailed selection within clusters
-        self.fine_attention = MultiHeadAttention(
-            d_model=d_model, 
-            num_heads=num_fine_heads
-        )
-        
-        # Adaptive weighting for hierarchical attention
-        self.adaptive_weighting = AdaptiveHeadWeighting({
-            'coarse': 0.6,
-            'fine': 0.4
-        })
+        # Head weights for stage 1; QKVAttentionRetriever sets them per query.
+        self.head_weights = dict(DEFAULT_HEAD_WEIGHTS)
+        # (No attention layers are built here: retrieval never used them, and
+        # constructing d x d weight matrices on every query was pure overhead.)
 
     def compute_coarse_attention(
         self,
@@ -1050,152 +1191,59 @@ class HierarchicalAttention:
         focus_buffer: Optional[Any] = None
     ) -> AttentionResult:
         """
-        Perform hierarchical 2-stage attention retrieval:
-        1. Attention-based GKU selection (influenced by focus buffer)
-        2. Attention-based selection of AKUs belonging to those GKUs
+        Two-stage retrieval: the best GKUs (at least coarse_top_k, more when
+        top_k asks for more), then their facts ranked by similarity.
+        See _two_stage_retrieve for what the result contains.
         """
-        # Step 1: Get GKUs and perform Stage 1 attention
-        gkus = await storage.get_gkus_by_workspace(workspace_id)
-        
-        if not gkus:
-            # Fallback: Mesh has not been consolidated yet. Retrieve directly from AKUs.
-            akus = await storage.find_similar_akus(workspace_id, query_embedding, threshold=0.5, limit=top_k)
-            if not akus:
-                return AttentionResult(
-                    scores=np.array([]),
-                    weights={'hierarchical': np.array([])},
-                    interpretations={'fallback_used': True, 'reason': 'no_gkus_or_akus'}
-                )
-            
-            final_scores = [aku['similarity'] for aku in akus]
-            interpretations = {
-                'top_aku_ids': [aku['id'] for aku in akus],
-                'hierarchical_2stage': False,
-                'fallback_used': True,
-                'reason': 'no_gkus_fresh_mesh'
-            }
-            
-            return AttentionResult(
-                scores=np.array(final_scores),
-                weights={'aku_attention': np.array(final_scores)},
-                interpretations=interpretations
-            )
-        
-        # Prepare GKU data for Stage 1
-        gku_embeddings = []
-        gku_patterns = []
-        gku_times = []
-        gku_ids = []
-        
-        for gku in gkus:
-            emb = gku.get('centroid_embedding')
-            if emb is not None and len(emb) > 0:
-                gku_embeddings.append(np.array(emb))
-                gku_patterns.append(gku.get('pattern_signature', {}))
-                gku_times.append({'created_at': gku.get('created_at')})
-                gku_ids.append(gku['id'])
-        
-        if not gku_embeddings:
-            return AttentionResult(scores=np.array([]), weights={}, interpretations={})
-
-        query_emb_array = np.array(query_embedding)
-        
-        # Compute Stage 1 (GKU) attention
-        # We'll use semantic, structural and temporal heads similar to the main retriever
-        # but for simplicity in this method we'll use similarity + focus boost
-        gku_matrix = np.stack(gku_embeddings)
-        gku_sims = np.dot(gku_matrix, query_emb_array) / (np.linalg.norm(gku_matrix, axis=1) * np.linalg.norm(query_emb_array) + 1e-8)
-        
-        # Focus Buffer Boost for GKUs
-        focus_boosts = np.zeros(len(gku_ids))
-        if focus_buffer and hasattr(focus_buffer, 'items'):
-            # In a real system, we'd have a mapping of AKU -> GKU. 
-            # For now, we'll look for AKUs belonging to these GKUs that are in focus.
-            for i, gku_id in enumerate(gku_ids):
-                child_akus = await storage.get_akus_in_gku(gku_id)
-                for child in child_akus:
-                    if child['id'] in focus_buffer.items:
-                        focus_boosts[i] += focus_buffer.items[child['id']].current_weight
-        
-        stage1_scores = gku_sims + 0.5 * focus_boosts
-        top_gku_indices = np.argsort(stage1_scores)[-self.coarse_top_k:][::-1]
-        selected_gku_ids = [gku_ids[i] for i in top_gku_indices]
-        
-        # Step 2: Get all AKUs from selected GKUs
-        all_child_akus = []
-        for gku_id in selected_gku_ids:
-            akus_in_gku = await storage.get_akus_in_gku(gku_id)
-            for aku in akus_in_gku:
-                # Add parent GKU info for metadata
-                aku['parent_gku_id'] = gku_id
-                all_child_akus.append(aku)
-        
-        if not all_child_akus:
-            return AttentionResult(scores=np.array([]), weights={}, interpretations={'selected_gku_ids': selected_gku_ids})
-        
-        # Step 3: Stage 2 Attention on Child AKUs
-        aku_embeddings = [np.array(aku['embedding']) for aku in all_child_akus if aku.get('embedding')]
-        if not aku_embeddings:
-             return AttentionResult(scores=np.array([]), weights={}, interpretations={'selected_gku_ids': selected_gku_ids})
-             
-        aku_matrix = np.stack(aku_embeddings)
-        aku_sims = np.dot(aku_matrix, query_emb_array) / (np.linalg.norm(aku_matrix, axis=1) * np.linalg.norm(query_emb_array) + 1e-8)
-        
-        # Final scores for AKUs
-        top_aku_indices = np.argsort(aku_sims)[-top_k:][::-1]
-        final_akus = [all_child_akus[i] for i in top_aku_indices]
-        final_scores = [aku_sims[i] for i in top_aku_indices]
-        
-        # Prepare results
-        interpretations = {
-            'top_aku_ids': [aku['id'] for aku in final_akus],
-            'selected_gku_ids': selected_gku_ids,
-            'hierarchical_2stage': True,
-            'gku_scores': {gku_ids[i]: float(stage1_scores[i]) for i in top_gku_indices}
-        }
-        
-        return AttentionResult(
-            scores=np.array(final_scores),
-            weights={'aku_attention': aku_sims},
-            interpretations=interpretations
+        return await _two_stage_retrieve(
+            storage, workspace_id, query_embedding, query_pattern, query_time_context,
+            head_weights=self.head_weights or DEFAULT_HEAD_WEIGHTS,
+            num_gkus=max(self.coarse_top_k, top_k),
+            top_k=top_k,
+            focus_buffer=focus_buffer,
+            mode='hierarchical'
         )
 
 
 class QKVAttentionRetriever:
     """
-    Main QKV Attention Retriever that combines all three heads.
+    Scores GKUs with three heads (semantic, structural, temporal) and ranks the
+    facts of the best ones. Despite the name, there is no learned Q/K/V
+    projection: each head is a similarity function and the heads are combined
+    as a weighted average.
     """
 
-    def __init__(self, embedding_dim: int = 768, num_heads: int = 8, use_adaptive_weights: bool = False, use_hierarchical_attention: bool = False):
+    def __init__(self, embedding_dim: int = 768, num_heads: int = 8, use_adaptive_weights: bool = False,
+                 use_hierarchical_attention: bool = False,
+                 adaptive_weighting: Optional['AdaptiveHeadWeighting'] = None):
+        """
+        Args:
+            embedding_dim, num_heads: kept for compatibility; retrieval builds no
+                attention layers (it never used them).
+            use_hierarchical_attention: select at least HierarchicalAttention's
+                coarse_top_k GKUs instead of exactly top_k.
+            adaptive_weighting: A long-lived AdaptiveHeadWeighting to read head
+                weights from. Pass the same instance on every query so feedback
+                accumulates; a retriever is usually created per query, so one
+                created here would forget everything after the query.
+        """
+        self.embedding_dim = embedding_dim
+        self.num_heads = _compatible_heads(embedding_dim, num_heads)
         self.semantic_head = SemanticRetrievalHead(embedding_dim)
         self.structural_head = StructuralRetrievalHead()
         self.temporal_head = TemporalRetrievalHead()
-        self.multihead_attn = MultiHeadAttention(embedding_dim, num_heads)
-        self.sparse_attn = SparseAttention(embedding_dim, num_heads)
-        
-        # Hierarchical attention
+
         self.use_hierarchical_attention = use_hierarchical_attention
         if use_hierarchical_attention:
-            self.hierarchical_attn = HierarchicalAttention(
-                d_model=embedding_dim,
-                num_coarse_heads=max(1, num_heads//2),
-                num_fine_heads=num_heads
-            )
-        
-        # Option to use adaptive head weighting
+            self.hierarchical_attn = HierarchicalAttention(d_model=embedding_dim)
+
         self.use_adaptive_weights = use_adaptive_weights
         if use_adaptive_weights:
-            self.adaptive_weighting = AdaptiveHeadWeighting()
-            # Start with initial weights
+            self.adaptive_weighting = adaptive_weighting or AdaptiveHeadWeighting()
             self.head_weights = self.adaptive_weighting.get_current_weights()
         else:
-            # Fixed head weights
-            self.head_weights = {
-                'semantic': 0.4,
-                'structural': 0.4,
-                'temporal': 0.2
-            }
-    
+            self.head_weights = dict(DEFAULT_HEAD_WEIGHTS)
+
     async def retrieve(
         self,
         storage: BaseStorage,
@@ -1208,177 +1256,42 @@ class QKVAttentionRetriever:
         focus_buffer: Optional[Any] = None
     ) -> AttentionResult:
         """
-        Retrieve relevant AKUs using multi-head attention mechanism.
+        Retrieve the facts of the best-scoring GKUs.
 
         Args:
-            storage: Storage interface
-            workspace_id: ID of the workspace to search in
-            query_embedding: Embedding representation of the query
-            query_pattern: Pattern signature of the query (optional)
-            query_time_context: Time context of the query (optional)
-            top_k: Number of top results to return
-            use_sparse_attention: Whether to use sparse attention mechanism
+            use_sparse_attention: accepted for compatibility and ignored; no
+                sparse attention runs during retrieval.
+            focus_buffer: facts the conversation is already about; GKUs holding
+                them get a bounded boost.
 
         Returns:
-            AttentionResult with scores, weights, and interpretations
+            AttentionResult; see _two_stage_retrieve for the interpretations.
         """
-        try:
-            # If using hierarchical attention, delegate to hierarchical attention mechanism
-            if self.use_hierarchical_attention:
-                return await self.hierarchical_attn.retrieve_hierarchical(
-                    storage=storage,
-                    workspace_id=workspace_id,
-                    query_embedding=query_embedding,
-                    query_pattern=query_pattern,
-                    query_time_context=query_time_context,
-                    top_k=top_k,
-                    focus_buffer=focus_buffer
-                )
+        if self.use_adaptive_weights:
+            # Whatever real feedback (RetrievalService.record_head_feedback) has taught so far.
+            self.head_weights = self.adaptive_weighting.get_current_weights()
 
-            # Get all GKUs in the workspace
-            gkus = await storage.get_gkus_by_workspace(workspace_id)
-
-            if not gkus:
-                return AttentionResult(
-                    scores=np.array([]),
-                    weights={'semantic': np.array([]), 'structural': np.array([]), 'temporal': np.array([])},
-                    interpretations={}
-                )
-
-            # Prepare GKU data
-            gku_embeddings = []
-            gku_patterns = []
-            gku_times = []
-            gku_ids = []
-
-            for gku in gkus:
-                # Extract embeddings
-                emb = gku.get('centroid_embedding')
-                if emb is not None and len(emb) > 0:
-                    gku_embeddings.append(np.array(emb))
-                else:
-                    # Fallback to zero embedding if missing, or skip
-                    continue
-
-                # Extract patterns
-                gku_patterns.append(gku.get('pattern_signature', {}))
-
-                # Extract temporal info
-                gku_times.append({'created_at': gku.get('created_at')})
-                gku_ids.append(gku['id'])
-
-            # Convert query embedding to numpy array
-            query_emb_array = np.array(query_embedding)
-
-            # If using adaptive weights, update them based on query characteristics
-            if self.use_adaptive_weights:
-                # For now, we'll use a simple performance feedback mechanism
-                performance_feedback = {
-                    'semantic': 0.8,
-                    'structural': 0.7,
-                    'temporal': 0.6
-                }
-                
-                self.head_weights = self.adaptive_weighting.update_weights_based_on_query(
-                    query_emb_array,
-                    query_pattern,
-                    query_time_context,
-                    performance_feedback
-                )
-
-            # Compute attention for each head
-            semantic_scores = self.semantic_head.compute_attention(query_emb_array, gku_embeddings)
-            structural_scores = self.structural_head.compute_attention(
-                query_pattern or {},
-                gku_patterns
+        if self.use_hierarchical_attention:
+            self.hierarchical_attn.head_weights = self.head_weights
+            result = await self.hierarchical_attn.retrieve_hierarchical(
+                storage=storage,
+                workspace_id=workspace_id,
+                query_embedding=query_embedding,
+                query_pattern=query_pattern,
+                query_time_context=query_time_context,
+                top_k=top_k,
+                focus_buffer=focus_buffer
             )
-            temporal_scores = self.temporal_head.compute_attention(
-                query_time_context,
-                gku_times
+        else:
+            result = await _two_stage_retrieve(
+                storage, workspace_id, query_embedding, query_pattern, query_time_context,
+                head_weights=self.head_weights, num_gkus=top_k, top_k=top_k,
+                focus_buffer=focus_buffer, mode='flat'
             )
+        result.interpretations['adaptive_weights_used'] = self.use_adaptive_weights
+        result.interpretations['hierarchical_attention_used'] = self.use_hierarchical_attention
+        return result
 
-            # Normalize scores
-            if len(semantic_scores) > 0:
-                semantic_scores = semantic_scores / (np.sum(semantic_scores) + 1e-8)
-            if len(structural_scores) > 0:
-                structural_scores = structural_scores / (np.sum(structural_scores) + 1e-8)
-            if len(temporal_scores) > 0:
-                temporal_scores = temporal_scores / (np.sum(temporal_scores) + 1e-8)
-
-            # Apply Focus Buffer boosts to GKUs
-            focus_boosts = np.ones(len(gkus))
-            if focus_buffer and hasattr(focus_buffer, 'items'):
-                # For each GKU, check if its AKUs are in the focus buffer
-                for i, gku in enumerate(gkus):
-                    gku_id = gku['id']
-                    # We might need to fetch AKUs for this GKU to check focus
-                    # For performance, we'll assume the GKU model has a reference or we check recent activations
-                    # Simplified: if any AKU in focus buffer belongs to this GKU
-                    # In a real impl, we'd have a mapping. Let's assume a simplified boost for now.
-                    for item_id, item in focus_buffer.items.items():
-                        # If the focus item weight is high, boost related GKUs
-                        # This logic would ideally be backed by a gku_id in the FocusItem or a lookup
-                        pass
-
-            # Combined scores (simplified - ignoring sparse attention for GKUs for now as they are fewer)
-            combined_scores = (
-                self.head_weights['semantic'] * semantic_scores +
-                self.head_weights['structural'] * structural_scores +
-                self.head_weights['temporal'] * temporal_scores
-            )
-
-            # Normalize combined scores
-            combined_scores = combined_scores / (np.sum(combined_scores) + 1e-8)
-
-            # Get top-k results
-            if len(combined_scores) > 0:
-                top_indices = np.argsort(combined_scores)[-top_k:][::-1]
-                top_scores = combined_scores[top_indices]
-            else:
-                top_indices = np.array([])
-                top_scores = np.array([])
-
-            # Prepare interpretations
-            if len(top_indices) > 0:
-                top_indices_list = [int(idx) for idx in top_indices.flatten()] if isinstance(top_indices, np.ndarray) else [int(idx) for idx in top_indices]
-                top_gku_ids = [gku_ids[i] for i in top_indices_list if i < len(gku_ids)]
-                semantic_contributions = semantic_scores[top_indices] if len(semantic_scores) > 0 else []
-                structural_contributions = structural_scores[top_indices] if len(structural_scores) > 0 else []
-                temporal_contributions = temporal_scores[top_indices] if len(temporal_scores) > 0 else []
-            else:
-                top_gku_ids = []
-                semantic_contributions = []
-                structural_contributions = []
-                temporal_contributions = []
-
-            interpretations = {
-                'top_gku_ids': top_gku_ids,
-                'semantic_contributions': semantic_contributions,
-                'structural_contributions': structural_contributions,
-                'temporal_contributions': temporal_contributions,
-                'head_weights_used': self.head_weights,
-                'use_sparse_attention': use_sparse_attention,
-                'adaptive_weights_used': self.use_adaptive_weights,
-                'hierarchical_attention_used': self.use_hierarchical_attention
-            }
-
-            # Return attention weights for each head
-            weights = {
-                'semantic': semantic_scores,
-                'structural': structural_scores,
-                'temporal': temporal_scores
-            }
-
-            return AttentionResult(
-                scores=top_scores,
-                weights=weights,
-                interpretations=interpretations
-            )
-
-        except Exception as e:
-            logger.error(f"Error in QKV attention retrieval: {e}")
-            raise
-    
     def interpret_attention_weights(self, result: AttentionResult) -> Dict[str, Any]:
         """
         Interpret the attention weights to provide explanations for retrieval decisions.

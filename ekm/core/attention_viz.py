@@ -4,13 +4,21 @@ Provides utilities for visualizing attention weights and debugging the retrieval
 """
 
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
 from typing import Dict, List, Any, Optional
 import io
 import base64
 from dataclasses import dataclass
-import pandas as pd
+
+# Plotting libraries are only needed by AttentionVisualizer. AttentionDebugger
+# (used by retrieval's debug_mode) works without them.
+try:
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    import pandas as pd
+    PLOTTING_AVAILABLE = True
+except ImportError:
+    plt = sns = pd = None
+    PLOTTING_AVAILABLE = False
 
 
 @dataclass
@@ -28,6 +36,8 @@ class AttentionVisualizer:
     """Visualization tools for attention mechanisms."""
     
     def __init__(self):
+        if not PLOTTING_AVAILABLE:
+            raise ImportError("AttentionVisualizer needs matplotlib, seaborn and pandas")
         # Set up matplotlib style
         plt.style.use('default')
         sns.set_palette("husl")
@@ -214,7 +224,8 @@ class AttentionDebugger:
     """Debugging tools for attention mechanisms."""
     
     def __init__(self):
-        self.visualizer = AttentionVisualizer()
+        # Visualization is optional; debug info itself needs only numpy.
+        self.visualizer = AttentionVisualizer() if PLOTTING_AVAILABLE else None
     
     def create_debug_info(
         self,

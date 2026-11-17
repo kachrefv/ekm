@@ -42,7 +42,7 @@ encoders.jsonable_encoder = patched_jsonable_encoder
 from ekm.core.mesh import EKM
 from ekm.core.agent import EKMAgent
 from ekm.storage.sql import SQLStorage
-from ekm.providers.gemini import GeminiProvider
+from ekm.providers.openrouter import OpenRouterProvider
 from ekm.core.models import Base, Workspace, GKU, AKU, AKURelationship, gku_aku_association, ChatSession, ChatMessage, Persona, ReflectiveConsciousness, Setting, Task, TaskStatus
 from ekm.core.consolidation import SleepConsolidator
 from ekm.utils.document_loader import DocumentLoader
@@ -60,7 +60,13 @@ app.add_middleware(
 
 # Configuration
 DB_URL = os.environ.get("EKM_DB_URL", "sqlite:///ekm.db")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+
+
+def make_provider() -> OpenRouterProvider:
+    """Claude Haiku 5.5 (LLM) and an OpenRouter embedding model, both via OpenRouter.
+    Models can be overridden with OPENROUTER_LLM_MODEL / OPENROUTER_EMBEDDING_MODEL."""
+    return OpenRouterProvider(api_key=OPENROUTER_API_KEY)
 
 # Convert DB_URL to async dialect if needed
 if DB_URL.startswith("sqlite://"):
@@ -82,13 +88,11 @@ SessionLocal = async_sessionmaker(bind=engine, class_=AsyncSession)
 async def get_ekm_instance(workspace_id: Optional[str] = None):
     db_session = SessionLocal()
     storage = SQLStorage(db=db_session)
-    api_key = GEMINI_API_KEY
-    provider = GeminiProvider(api_key=api_key)
+    provider = make_provider()
 
-    # Default config
+    # Default config (VECTOR_DIMENSION is detected from the embedding model)
     config = {
         "EKM_SEMANTIC_THRESHOLD": 0.70,
-        "VECTOR_DIMENSION": 3072,
         "EKM_MIN_CHUNK_SIZE": 512,
         "EKM_MAX_CHUNK_SIZE": 2048,
         "RL_LEARNING_RATE": 0.1
@@ -523,10 +527,11 @@ async def sleep_cycle(workspace_id: str):
     ekm, db = await get_ekm_instance(workspace_id)
     try:
         ws_uuid = uuid.UUID(workspace_id)
-        api_key = GEMINI_API_KEY
-        provider = GeminiProvider(api_key=api_key)
-        consolidator = SleepConsolidator(ekm.storage, provider, provider)
+        # Reuse the EKM's OpenRouter provider (LLM + embeddings)
+        consolidator = SleepConsolidator(ekm.storage, ekm.llm, ekm.embeddings)
         consolidator_results = await consolidator.run_consolidation(workspace_id)
+        # Consolidation archives and merges AKUs; rebuild the fact index on next use
+        ekm.scalable_backend.invalidate_workspace_index(workspace_id)
 
         # --- SELF-REFLECTION ADDITION ---
         # Fetch some recent AKUs for context

@@ -9,8 +9,9 @@ services:
       - DATABASE_URL=postgresql://ekm_user:ekm_password@db:5432/ekm_db
       - EKM_DB_URL=postgresql://ekm_user:ekm_password@db:5432/ekm_db
       - REDIS_URL=redis://redis:6379
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - OPENROUTER_LLM_MODEL=${OPENROUTER_LLM_MODEL:-anthropic/claude-haiku-5.5}
+      - OPENROUTER_EMBEDDING_MODEL=${OPENROUTER_EMBEDDING_MODEL:-openai/text-embedding-3-small}
     depends_on:
       - db
       - redis

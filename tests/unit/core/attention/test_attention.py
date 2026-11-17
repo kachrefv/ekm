@@ -13,8 +13,9 @@ async def test_qkv_attention_retriever_initialization():
     assert retriever.semantic_head is not None
     assert retriever.structural_head is not None
     assert retriever.temporal_head is not None
-    assert retriever.multihead_attn is not None
-    assert retriever.sparse_attn is not None
+    # Retrieval never used the QKV/sparse layers, so they are no longer built per query
+    assert not hasattr(retriever, 'multihead_attn')
+    assert not hasattr(retriever, 'sparse_attn')
 
 
 @pytest.mark.asyncio
@@ -52,7 +53,10 @@ async def test_semantic_attention_computation():
     # Compute attention
     attention_weights = head.compute_attention(query_embedding, gku_embeddings)
     
-    # Verify output
+    # Verify output: raw cosine similarities (no softmax, which flattened the
+    # differences between GKUs to near-uniform weights)
     assert len(attention_weights) == 5
-    assert np.allclose(np.sum(attention_weights), 1.0)  # Should sum to 1 (softmax)
-    assert np.all(attention_weights >= 0)  # All weights should be non-negative
+    expected = [np.dot(query_embedding, g) / (np.linalg.norm(query_embedding) * np.linalg.norm(g))
+                for g in gku_embeddings]
+    assert np.allclose(attention_weights, expected)
+    assert np.all((attention_weights >= -1.0) & (attention_weights <= 1.0))

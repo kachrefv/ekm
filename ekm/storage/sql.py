@@ -6,8 +6,7 @@ import json
 import logging
 import numpy as np
 from .base import BaseStorage
-from ..core.models import Workspace, Episode, AKU, AKURelationship, GKU
-from ..core.utils import cosine_similarity
+from ..core.models import Workspace, Episode, AKU, AKURelationship, GKU, gku_aku_association
 
 # Import pgvector if available
 try:
@@ -16,12 +15,29 @@ try:
 except ImportError:
     PGVECTOR_AVAILABLE = False
 
+def _unit_vector(embedding) -> Optional[np.ndarray]:
+    """An embedding (list, array, JSON string or pgvector value) scaled to length 1, or None."""
+    if embedding is None:
+        return None
+    if isinstance(embedding, (bytes, bytearray)):
+        embedding = embedding.decode('utf-8')
+    if isinstance(embedding, str):
+        try:
+            embedding = json.loads(embedding)
+        except json.JSONDecodeError:
+            return None
+    vec = np.asarray(embedding, dtype=np.float32).reshape(-1)
+    norm = float(np.linalg.norm(vec)) if vec.size else 0.0
+    if norm == 0.0:
+        return None
+    return vec / norm
+
+
 class SQLStorage(BaseStorage):
     def __init__(self, db: AsyncSession):
         self.db = db
-        from ..core.scalability import VectorIndexManager
-        self.vector_index = VectorIndexManager(dimension=None)
-        self._index_populated = False
+        # workspace_id -> (episode ids, unit-vector matrix); see _episode_index
+        self._episode_indexes: Dict[str, Any] = {}
 
     def _serialize_embedding(self, embedding):
         if isinstance(embedding, (list, np.ndarray)):
@@ -83,13 +99,8 @@ class SQLStorage(BaseStorage):
         await self.db.commit()
         await self.db.refresh(episode)  # Refresh to get ID if not already set
 
-        # Update vector index if it's being used
-        if not PGVECTOR_AVAILABLE or not (self.db.get_bind().dialect.name == 'postgresql'):
-             try:
-                 emb_array = np.array([embedding]).astype('float32')
-                 self.vector_index.add_vectors(emb_array, [str(episode.id)])
-             except Exception as e:
-                 logging.warning(f"Vector index update failed for episode {episode.id}: {e}")
+        if not self._use_pgvector():
+            self._add_to_episode_index(workspace_id, str(episode.id), embedding)
 
         return str(episode.id)
 
@@ -123,110 +134,105 @@ class SQLStorage(BaseStorage):
         await self.db.commit()
 
     async def find_similar_episodes(self, workspace_id: str, embedding: List[float], threshold: float, limit: int) -> List[Dict[str, Any]]:
-        query_emb = self._serialize_embedding(embedding)
-        
-        is_postgres = self.db.get_bind().dialect.name == 'postgresql'
+        """
+        Episodes of this workspace whose cosine similarity to `embedding` is at
+        least `threshold`, best first. 'similarity' is cosine on every backend
+        (pgvector or not), so scores from here compare directly with fact scores.
+        """
+        query = _unit_vector(embedding)
+        if query is None:
+            return []
 
-        if PGVECTOR_AVAILABLE and is_postgres:
-            # Use pgvector for similarity search
-            embedding_array = np.array(query_emb).astype(np.float32).tolist()
-
-            # Using raw SQL for pgvector cosine similarity operator
+        if self._use_pgvector():
             sql_query = text("""
-                SELECT id, content, summary,
+                SELECT id, content, summary, created_at,
                        (embedding <=> :query_embedding) AS distance
                 FROM ekm_episodes
                 WHERE workspace_id = :workspace_id
                 ORDER BY distance ASC
                 LIMIT :limit
             """)
-
             result = await self.db.execute(sql_query, {
-                'query_embedding': json.dumps(embedding_array),
+                'query_embedding': json.dumps(query.tolist()),
                 'workspace_id': uuid.UUID(workspace_id),
                 'limit': limit
             })
-            rows = result.fetchall()
-
-            # Convert distance to similarity (1 / (1 + distance))
-            return [
-                {
-                    'id': str(row[0]),
-                    'content': row[1],
-                    'summary': row[2],
-                    'similarity': 1 / (1 + row[3])
-                }
-                for row in rows
-            ]
-        else:
-            # Fallback: using VectorIndexManager (FAISS/Memory)
-            
-            # Populate index if not already done (Lazy Loading)
-            if not self._index_populated:
-                # Load all episodes for this workspace
-                result = await self.db.execute(
-                    select(Episode).where(Episode.workspace_id == uuid.UUID(workspace_id))
-                )
-                all_episodes = result.scalars().all()
-                if all_episodes:
-                    vectors = []
-                    ids = []
-                    for ep in all_episodes:
-                        if ep.embedding is not None:
-                             emb = ep.embedding
-                             # Handle list or json string
-                             if isinstance(emb, str):
-                                 emb = json.loads(emb)
-                             vectors.append(emb)
-                             ids.append(str(ep.id))
-                    
-                    if vectors:
-                        self.vector_index.add_vectors(np.array(vectors), ids)
-                
-                self._index_populated = True
-            
-            # Search index
-            query_vec = np.array(query_emb).astype(np.float32)
-            distances, ids = self.vector_index.search(query_vec, limit)
-            
-            # Fetch full details for the IDs
             results = []
-            valid_ids = [id_ for id_ in ids if id_ is not None]
-            
-            if not valid_ids:
-                return []
-                
-            uuids = [uuid.UUID(i) for i in valid_ids]
-            result = await self.db.execute(
-                select(Episode).where(Episode.id.in_(uuids))
-            )
-            episodes = result.scalars().all()
-            episode_map = {str(ep.id): ep for ep in episodes}
-            
-            for id_, dist in zip(ids, distances):
-                if id_ in episode_map:
-                    ep = episode_map[id_]
-                    sim = 1 / (1 + dist) # Convert distance to similarity
-                    if sim >= threshold:
-                        results.append({
-                            'id': str(ep.id),
-                            'summary': ep.summary,
-                            'content': ep.content,
-                            'similarity': sim
-                        })
-                        
+            for row in result.fetchall():
+                sim = 1.0 - float(row[4])  # <=> is cosine distance
+                if sim >= threshold:
+                    results.append({'id': str(row[0]), 'content': row[1], 'summary': row[2],
+                                    'created_at': row[3], 'similarity': sim})
             return results
 
+        ids, matrix = await self._episode_index(workspace_id)
+        if not ids or matrix.shape[1] != query.shape[0]:
+            return []
+        sims = matrix @ query
+        order = [int(i) for i in np.argsort(-sims) if sims[i] >= threshold][:limit]
+        if not order:
+            return []
+        rows = await self.db.execute(
+            select(Episode).where(
+                Episode.id.in_([uuid.UUID(ids[i]) for i in order]),
+                Episode.workspace_id == uuid.UUID(workspace_id)
+            )
+        )
+        by_id = {str(ep.id): ep for ep in rows.scalars().all()}
+        results = []
+        for i in order:
+            ep = by_id.get(ids[i])
+            if ep is not None:
+                results.append({'id': ids[i], 'summary': ep.summary, 'content': ep.content,
+                                'created_at': ep.created_at, 'similarity': float(sims[i])})
+        return results
+
+    async def _episode_index(self, workspace_id: str):
+        """
+        (ids, unit-vector matrix) of one workspace's episodes, loaded from the
+        database on first use and kept per workspace. The previous single index
+        was filled with whichever workspace was queried first and searched
+        without a workspace filter, so other workspaces' episodes leaked in.
+        """
+        cached = self._episode_indexes.get(workspace_id)
+        if cached is not None:
+            return cached
+        result = await self.db.execute(
+            select(Episode.id, Episode.embedding).where(Episode.workspace_id == uuid.UUID(workspace_id))
+        )
+        ids, rows = [], []
+        for ep_id, emb in result.all():
+            vec = _unit_vector(emb)
+            if vec is None or (rows and vec.shape[0] != rows[0].shape[0]):
+                continue
+            ids.append(str(ep_id))
+            rows.append(vec)
+        matrix = np.vstack(rows) if rows else np.empty((0, 0), dtype=np.float32)
+        self._episode_indexes[workspace_id] = (ids, matrix)
+        return ids, matrix
+
+    def _add_to_episode_index(self, workspace_id: str, episode_id: str, embedding) -> None:
+        """Append to a workspace's cached index; if none is cached it is built on next search."""
+        cached = self._episode_indexes.get(workspace_id)
+        vec = _unit_vector(embedding)
+        if cached is None or vec is None:
+            return
+        ids, matrix = cached
+        if matrix.size and matrix.shape[1] != vec.shape[0]:
+            return
+        matrix = vec.reshape(1, -1) if not matrix.size else np.vstack([matrix, vec])
+        self._episode_indexes[workspace_id] = (ids + [episode_id], matrix)
+
+    def _use_pgvector(self) -> bool:
+        return PGVECTOR_AVAILABLE and self.db.get_bind().dialect.name == 'postgresql'
+
     async def find_similar_akus(self, workspace_id: str, embedding: List[float], threshold: float, limit: int) -> List[Dict[str, Any]]:
-        query_emb = self._serialize_embedding(embedding)
-        
-        is_postgres = self.db.get_bind().dialect.name == 'postgresql'
+        """Active facts of this workspace with cosine similarity >= threshold, best first."""
+        query = _unit_vector(embedding)
+        if query is None:
+            return []
 
-        if PGVECTOR_AVAILABLE and is_postgres:
-            # Use pgvector for similarity search
-            embedding_array = np.array(query_emb).astype(np.float32).tolist()
-
-            # Using raw SQL for pgvector cosine similarity operator
+        if self._use_pgvector():
             sql_query = text("""
                 SELECT id, content, episode_id,
                        (embedding <=> :query_embedding) AS distance
@@ -236,46 +242,41 @@ class SQLStorage(BaseStorage):
                 ORDER BY distance ASC
                 LIMIT :limit
             """)
-
             result = await self.db.execute(sql_query, {
-                'query_embedding': json.dumps(embedding_array),
+                'query_embedding': json.dumps(query.tolist()),
                 'workspace_id': uuid.UUID(workspace_id),
                 'limit': limit
             })
-            rows = result.fetchall()
-
-            # Convert distance to similarity (1 / (1 + distance))
-            return [
-                {
-                    'id': str(row[0]),
-                    'content': row[1],
-                    'episode_id': str(row[2]) if row[2] else None,
-                    'similarity': 1 / (1 + row[3])
-                }
-                for row in rows
-            ]
-        else:
-            # Fallback to original method
-            result = await self.db.execute(
-                select(AKU).where(
-                    AKU.workspace_id == uuid.UUID(workspace_id),
-                    AKU.is_archived == False
-                )
-            )
-            akus = result.scalars().all()
             results = []
-            for aku in akus:
-                if aku.embedding is not None:
-                    sim = cosine_similarity(query_emb, self._serialize_embedding(aku.embedding))
-                    if sim >= threshold:
-                        results.append({
-                            'id': str(aku.id),
-                            'content': aku.content,
-                            'episode_id': str(aku.episode_id) if aku.episode_id else None,
-                            'similarity': sim
-                        })
-            results.sort(key=lambda x: x['similarity'], reverse=True)
-            return results[:limit]
+            for row in result.fetchall():
+                sim = 1.0 - float(row[3])  # <=> is cosine distance
+                if sim >= threshold:
+                    results.append({'id': str(row[0]), 'content': row[1],
+                                    'episode_id': str(row[2]) if row[2] else None,
+                                    'similarity': sim})
+            return results
+
+        result = await self.db.execute(
+            select(AKU).where(
+                AKU.workspace_id == uuid.UUID(workspace_id),
+                AKU.is_archived == False
+            )
+        )
+        results = []
+        for aku in result.scalars().all():
+            vec = _unit_vector(aku.embedding)
+            if vec is None or vec.shape[0] != query.shape[0]:
+                continue
+            sim = float(vec @ query)
+            if sim >= threshold:
+                results.append({
+                    'id': str(aku.id),
+                    'content': aku.content,
+                    'episode_id': str(aku.episode_id) if aku.episode_id else None,
+                    'similarity': sim
+                })
+        results.sort(key=lambda x: x['similarity'], reverse=True)
+        return results[:limit]
 
     async def get_aku_relationships(self, workspace_id: str, aku_ids: List[str]) -> List[Dict[str, Any]]:
         uuids = [uuid.UUID(i) for i in aku_ids]
@@ -383,55 +384,100 @@ class SQLStorage(BaseStorage):
         ]
 
     async def associate_akus_with_gku(self, gku_id: str, aku_ids: List[str]):
-        """Associate AKUs with a GKU."""
-        from sqlalchemy import text
+        """Associate AKUs with a GKU.
 
-        gku_uuid = uuid.UUID(gku_id)
-        aku_uuids = [uuid.UUID(id) for id in aku_ids]
-
-        for aku_uuid in aku_uuids:
-            # Check if association already exists
-            result = await self.db.execute(
-                text("SELECT 1 FROM ekm_gku_akus WHERE gku_id = :gku_id AND aku_id = :aku_id"),
-                {"gku_id": str(gku_uuid), "aku_id": str(aku_uuid)}
-            )
-            existing = result.fetchone()
-
-            if not existing:
-                await self.db.execute(
-                    text("INSERT INTO ekm_gku_akus (gku_id, aku_id) VALUES (:gku_id, :aku_id)"),
-                    {"gku_id": str(gku_uuid), "aku_id": str(aku_uuid)}
-                )
-
+        Written through the association Table so ids are stored in the
+        dialect's own UUID format (raw SQL used to write dashed strings, which
+        SQLite stores differently from the ORM's 32-character hex).
+        """
+        from sqlalchemy import insert
+        gku_uuid = uuid.UUID(str(gku_id))
+        existing = set(await self._gku_member_ids(gku_uuid))
+        new_rows = []
+        for aku_id in aku_ids:
+            aku_uuid = uuid.UUID(str(aku_id))
+            if aku_uuid not in existing:
+                existing.add(aku_uuid)
+                new_rows.append({'gku_id': gku_uuid, 'aku_id': aku_uuid})
+        if new_rows:
+            await self.db.execute(insert(gku_aku_association), new_rows)
         await self.db.commit()
 
-    async def get_akus_in_gku(self, gku_id: str) -> List[Dict[str, Any]]:
-        """Get all AKUs associated with a specific GKU."""
-        from sqlalchemy import text
-
-        param_uuid = str(uuid.UUID(gku_id))
-
+    async def _gku_member_ids(self, gku_uuid: uuid.UUID) -> List[uuid.UUID]:
+        """AKU ids linked to a GKU, as UUIDs, including rows written in the
+        old dashed-string format (SQLite only)."""
         result = await self.db.execute(
-            text("""
-            SELECT a.id, a.content, a.embedding, a.aku_metadata, a.created_at
-            FROM ekm_akus a
-            JOIN ekm_gku_akus ga ON a.id = REPLACE(ga.aku_id, '-', '')
-            WHERE ga.gku_id = :gku_id
-            """),
-            {"gku_id": param_uuid}
+            select(gku_aku_association.c.aku_id).where(gku_aku_association.c.gku_id == gku_uuid)
         )
-        rows = result.fetchall()
+        ids = {self._as_uuid(v) for (v,) in result.all()}
+        if self.db.get_bind().dialect.name == 'sqlite':
+            legacy = await self.db.execute(
+                text("SELECT aku_id FROM ekm_gku_akus WHERE gku_id = :gku_id"),
+                {'gku_id': str(gku_uuid)}
+            )
+            ids.update(self._as_uuid(v) for (v,) in legacy.all())
+        ids.discard(None)
+        return list(ids)
 
+    @staticmethod
+    def _as_uuid(value) -> Optional[uuid.UUID]:
+        if isinstance(value, uuid.UUID):
+            return value
+        try:
+            return uuid.UUID(str(value))
+        except (TypeError, ValueError):
+            return None
+
+    async def get_akus_in_gku(self, gku_id: str) -> List[Dict[str, Any]]:
+        """Active (non-archived) AKUs associated with a GKU."""
+        member_ids = await self._gku_member_ids(uuid.UUID(str(gku_id)))
+        if not member_ids:
+            return []
+        result = await self.db.execute(
+            select(AKU).where(AKU.id.in_(member_ids), AKU.is_archived == False)
+        )
         return [
             {
-                'id': str(row[0]),
-                'content': row[1],
-                'embedding': self._deserialize_embedding(row[2]) if row[2] else None,
-                'aku_metadata': row[3],
-                'created_at': row[4]
+                'id': str(a.id),
+                'content': a.content,
+                'embedding': self._deserialize_embedding(a.embedding) if a.embedding is not None else None,
+                'aku_metadata': a.aku_metadata,
+                'episode_id': str(a.episode_id) if a.episode_id else None,
+                'created_at': a.created_at
             }
-            for row in rows
+            for a in result.scalars().all()
         ]
+
+    async def get_gku_ids_for_akus(self, workspace_id: str, aku_ids: List[str]) -> Dict[str, List[str]]:
+        """{aku_id: [GKU ids containing it]} for the given AKUs, in one query
+        (plus one for rows in the old dashed-string format on SQLite)."""
+        uuids = [u for u in (self._as_uuid(i) for i in aku_ids) if u is not None]
+        if not uuids:
+            return {}
+        result = await self.db.execute(
+            select(gku_aku_association.c.aku_id, gku_aku_association.c.gku_id)
+            .join(GKU, GKU.id == gku_aku_association.c.gku_id)
+            .where(gku_aku_association.c.aku_id.in_(uuids), GKU.workspace_id == uuid.UUID(workspace_id))
+        )
+        pairs = [(self._as_uuid(a), self._as_uuid(g)) for a, g in result.all()]
+        if self.db.get_bind().dialect.name == 'sqlite':
+            from sqlalchemy import bindparam
+            legacy = await self.db.execute(
+                text("SELECT aku_id, gku_id FROM ekm_gku_akus WHERE aku_id IN :ids")
+                .bindparams(bindparam('ids', expanding=True)),
+                {'ids': [str(u) for u in uuids]}
+            )
+            workspace_gkus = {self._as_uuid(g['id']) for g in await self.get_gkus_by_workspace(workspace_id)}
+            pairs += [(self._as_uuid(a), self._as_uuid(g)) for a, g in legacy.all()
+                      if self._as_uuid(g) in workspace_gkus]
+        membership: Dict[str, List[str]] = {}
+        for aku_uuid, gku_uuid in pairs:
+            if aku_uuid is None or gku_uuid is None:
+                continue
+            parents = membership.setdefault(str(aku_uuid), [])
+            if str(gku_uuid) not in parents:
+                parents.append(str(gku_uuid))
+        return membership
 
     async def get_akus_with_embeddings(self, workspace_id: str) -> List[Dict[str, Any]]:
         """Get all AKUs in a workspace that have embeddings."""
